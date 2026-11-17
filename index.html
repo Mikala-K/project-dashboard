@@ -20,7 +20,11 @@
     <div class="top-inner">
       <h1>Project Dashboard</h1>
       <p class="hello" id="hello"></p>
-      <button class="refresh" id="refresh" type="button" aria-label="Refresh data">Refresh</button>
+      <div class="top-actions">
+        <button class="top-btn solid" id="new-ticket" type="button">New ticket</button>
+        <button class="top-btn" id="new-project" type="button">New project</button>
+        <button class="top-btn" id="refresh" type="button">Refresh</button>
+      </div>
     </div>
   </header>
 
@@ -49,6 +53,8 @@
       <p class="gate-error" id="gate-error" role="alert"></p>
     </form>
   </div>
+
+  <dialog id="dialog" class="dialog"></dialog>
 
   <p class="status-line" id="status-line" role="status"></p>
   <script src="app.js"></script>
