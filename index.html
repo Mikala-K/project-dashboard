@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Project Dashboard</title>
+  <meta name="theme-color" content="#2b2342">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Dashboard">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600&family=Nunito+Sans:opsz,wght@6..12,400;6..12,600;6..12,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <h1>Project Dashboard</h1>
+      <p class="hello" id="hello"></p>
+      <button class="refresh" id="refresh" type="button" aria-label="Refresh data">Refresh</button>
+    </div>
+  </header>
+
+  <main id="app" class="layout">
+    <section class="next" aria-labelledby="next-title">
+      <h2 id="next-title">Up next for you</h2>
+      <ol class="next-list" id="next-list"></ol>
+    </section>
+
+    <section class="projects" aria-labelledby="projects-title">
+      <div class="projects-head">
+        <h2 id="projects-title">Projects</h2>
+        <label class="closed-toggle"><input type="checkbox" id="show-closed"> Show done and canceled</label>
+      </div>
+      <div class="chips" id="client-chips" role="group" aria-label="Filter by client"></div>
+      <div id="project-groups"></div>
+    </section>
+  </main>
+
+  <div class="gate" id="gate" hidden>
+    <form id="gate-form" class="gate-card">
+      <h2>Open your dashboard</h2>
+      <p>Paste the key from your dashboard link. It stays on this device only.</p>
+      <input id="gate-key" type="password" autocomplete="off" placeholder="Your key" required>
+      <button type="submit">Open dashboard</button>
+      <p class="gate-error" id="gate-error" role="alert"></p>
+    </form>
+  </div>
+
+  <p class="status-line" id="status-line" role="status"></p>
+  <script src="app.js"></script>
+</body>
+</html>
