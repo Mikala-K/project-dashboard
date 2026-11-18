@@ -63,6 +63,7 @@ button { cursor: pointer; }
   .next { position: sticky; top: 20px; }
 }
 .layout h2 { font-size: 22px; margin-bottom: 14px; }
+.layout > section { min-width: 0; }
 
 /* Tickets (Up next and inside projects) */
 .next-list, .ticket-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
@@ -215,3 +216,26 @@ button { cursor: pointer; }
 .status-line:empty { display: none; }
 
 @media (prefers-reduced-motion: reduce) { .seg-fill { transition: none; } }
+
+/* All tickets */
+.view-all { margin-top: 12px; }
+.all-tickets[hidden], .projects[hidden] { display: none; }
+.filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 4px 0 16px; }
+.filters select { width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: #fff; }
+.table-wrap { overflow-x: auto; background: var(--panel); border-radius: var(--radius-lg); }
+.tickets-table { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 820px; }
+.tickets-table th { text-align: left; border-bottom: 2px solid var(--line); padding: 0; }
+.sort { background: none; border: 0; padding: 12px 10px; font-weight: 700; width: 100%; text-align: left; white-space: nowrap; }
+.tickets-table td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tickets-table tr:last-child td { border-bottom: 0; }
+.id-cell { font-weight: 700; color: var(--ink-soft); white-space: nowrap; }
+.task-cell { min-width: 220px; }
+.sub-row td { background: var(--paper); }
+.sub-row .task-cell { padding-left: 28px; }
+.sub-toggle { display: block; margin-top: 4px; font-size: 13px; }
+.inline-select { padding: 4px 6px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: #fff; }
+.pill { padding: 1px 8px; border-radius: 999px; background: #e6f2df; }
+.pill[data-priority="High"] { background: #f7ddd5; }
+.pill[data-priority="Medium"] { background: #f8ecd0; }
+.nowrap { white-space: nowrap; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }

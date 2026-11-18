@@ -7,7 +7,8 @@ const TICKET_STATUSES = ['Open', 'In progress', 'Blocked', 'Backlog'];
 const KEY_STORE = 'pd_key';
 
 const $ = (id) => document.getElementById(id);
-const state = { data: null, client: 'all', showClosed: false, openProjects: new Set() };
+const state = { data: null, client: 'all', showClosed: false, openProjects: new Set(), view: 'projects',
+  sort: { key: 'ticket_id', dir: 1 }, filter: { project: '', assignee: '', category: '' }, expanded: new Set() };
 
 // ---------- key handling ----------
 function storedKey() {
@@ -91,6 +92,14 @@ function render() {
   renderNext(d);
   renderChips(d);
   renderProjects(d);
+  renderAllTickets(d);
+  showView();
+}
+function showView() {
+  const tickets = state.view === 'tickets';
+  $('projects').hidden = tickets;
+  $('all-tickets').hidden = !tickets;
+  $('view-all').textContent = tickets ? 'Back to projects' : 'View all tickets';
 }
 const projectOf = (d, id) => d.projects.find((x) => x.project_id === id);
 const projectName = (d, id) => (projectOf(d, id) || {}).display_name || id;
@@ -268,6 +277,93 @@ function maintenancePreview(d) {
   }));
 }
 
+
+// ---------- all tickets ----------
+const idNum = (id) => Number(String(id || '').replace(/\D/g, '')) || 0;
+const PRIORITY_RANK = { High: 0, Medium: 1, Low: 2 };
+const TICKET_STATUS_RANK = { 'In progress': 0, Open: 1, Blocked: 2, Backlog: 3 };
+const COLUMNS = [
+  ['ticket_id', 'ID', (t) => idNum(t.ticket_id)],
+  ['task', 'Task', (t) => t.task.toLowerCase()],
+  ['project', 'Project', (t) => projectName(state.data, t.project)],
+  ['category', 'Category', (t) => (t.category || '~').toLowerCase()],
+  ['assignee', 'Assignee', (t) => t.assignee || '~'],
+  ['priority', 'Priority', (t) => PRIORITY_RANK[t.priority] ?? 3],
+  ['status', 'Status', (t) => TICKET_STATUS_RANK[t.status] ?? 9],
+  ['due_date', 'Due', (t) => toIso(t.due_date) || '9999'],
+];
+
+function renderAllTickets(d) {
+  const f = state.filter;
+  const filters = $('ticket-filters');
+  const sel = (key, label, options) => field(label, el('select', {
+    onchange: (e) => { f[key] = e.target.value; renderAllTickets(d); },
+  }, options.map(([v, l]) => el('option', { value: v, selected: f[key] === v }, l))));
+  const cats = [...new Set(d.tickets.map((t) => t.category).filter(Boolean))].sort();
+  filters.replaceChildren(
+    sel('project', 'Project', [['', 'All projects'], ...d.projects.filter((p) => d.tickets.some((t) => t.project === p.project_id)).map((p) => [p.project_id, p.display_name])]),
+    sel('assignee', 'Assignee', [['', 'Everyone'], ['-', 'Unassigned'], ...d.people.map((n) => [n, n])]),
+    sel('category', 'Category', [['', 'All categories'], ...cats.map((c) => [c, c])]),
+  );
+
+  const ids = new Set(d.tickets.map((t) => t.ticket_id));
+  const match = (t) => (!f.project || t.project === f.project)
+    && (!f.assignee || (f.assignee === '-' ? !t.assignee : split(t.assignee).includes(f.assignee)))
+    && (!f.category || t.category === f.category);
+  const kidsOf = (t) => d.tickets.filter((k) => k.parent_ticket === t.ticket_id);
+  // A parent stays visible when any of its subtasks match the filters
+  const tops = d.tickets.filter((t) => !t.parent_ticket || !ids.has(t.parent_ticket))
+    .filter((t) => match(t) || kidsOf(t).some(match));
+  const [, , keyFn] = COLUMNS.find(([k]) => k === state.sort.key);
+  const cmp = (a, b) => {
+    const x = keyFn(a); const y = keyFn(b);
+    return (x < y ? -1 : x > y ? 1 : 0) * state.sort.dir || idNum(a.ticket_id) - idNum(b.ticket_id);
+  };
+
+  const head = el('tr', {}, COLUMNS.map(([k, label]) => {
+    const active = state.sort.key === k;
+    return el('th', { scope: 'col', 'aria-sort': active ? (state.sort.dir === 1 ? 'ascending' : 'descending') : 'none' },
+      el('button', { type: 'button', class: 'sort', onclick: () => {
+        state.sort = { key: k, dir: active ? -state.sort.dir : 1 };
+        renderAllTickets(d);
+      } }, label, active ? (state.sort.dir === 1 ? ' ▲' : ' ▼') : ''));
+  }), el('th', { scope: 'col' }, el('span', { class: 'sr-only' }, 'Check off')));
+
+  const row = (t, isSub) => {
+    const kids = isSub ? [] : kidsOf(t);
+    const open = state.expanded.has(t.ticket_id);
+    const assign = el('select', { class: 'inline-select', 'aria-label': `Assignee for ${t.ticket_id}`, onchange: async (e) => {
+      try { status('Saving…'); await post('ticket/update', { ticket_id: t.ticket_id, assignee: e.target.value }); await load(); status('Assignee saved'); }
+      catch (ex) { status(`Could not save: ${ex.message}`); }
+    } }, [['', 'Unassigned'], ...d.people.map((n) => [n, n])].map(([v, l]) => el('option', { value: v, selected: (t.assignee || '') === v }, l)));
+    return el('tr', { class: isSub ? 'sub-row' : '', 'data-priority': t.priority },
+      el('td', { class: 'id-cell' }, t.ticket_id),
+      el('td', { class: 'task-cell' },
+        el('button', { type: 'button', class: 'ticket-open', onclick: () => openTicket({ ticket: t }) }, el('span', { class: 'ticket-task' }, t.task)),
+        kids.length ? el('button', { type: 'button', class: 'link sub-toggle', 'aria-expanded': String(open), onclick: () => {
+          if (open) state.expanded.delete(t.ticket_id); else state.expanded.add(t.ticket_id);
+          renderAllTickets(d);
+        } }, `${open ? 'Hide' : 'Show'} ${kids.length} subtask${kids.length === 1 ? '' : 's'}`) : null),
+      el('td', {}, projectName(d, t.project)),
+      el('td', {}, t.category || ''),
+      el('td', {}, assign),
+      el('td', {}, el('span', { class: 'pill', 'data-priority': t.priority }, t.priority || 'Low')),
+      el('td', {}, t.status),
+      el('td', { class: 'nowrap' }, t.due_date || ''),
+      el('td', {}, el('input', { type: 'checkbox', class: 'tick', 'aria-label': `Check off ${t.task}`, onchange: (e) => { e.target.checked = false; openComplete(t); } })),
+    );
+  };
+
+  const rows = [];
+  for (const t of tops.sort(cmp)) {
+    rows.push(row(t, false));
+    if (state.expanded.has(t.ticket_id)) for (const k of kidsOf(t).sort(cmp)) rows.push(row(k, true));
+  }
+  $('ticket-table').replaceChildren(rows.length
+    ? el('table', { class: 'tickets-table' }, el('thead', {}, head), el('tbody', {}, rows))
+    : el('p', { class: 'meter-empty' }, 'No open tickets match these filters.'));
+}
+
 // ---------- dialogs ----------
 function field(label, input, hint) {
   return el('label', { class: 'field' }, el('span', { class: 'field-label' }, label), input, hint ? el('span', { class: 'field-hint' }, hint) : null);
@@ -395,6 +491,8 @@ function openProject(p) {
 
 // ---------- events ----------
 $('refresh').addEventListener('click', load);
+$('view-all').addEventListener('click', () => { state.view = state.view === 'tickets' ? 'projects' : 'tickets'; showView(); });
+$('back-projects').addEventListener('click', () => { state.view = 'projects'; showView(); });
 $('new-ticket').addEventListener('click', () => state.data && openTicket({}));
 $('new-project').addEventListener('click', () => state.data && openProject(null));
 $('show-closed').addEventListener('change', (e) => {

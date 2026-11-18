@@ -32,9 +32,19 @@
     <section class="next" aria-labelledby="next-title">
       <h2 id="next-title">Up next for you</h2>
       <ol class="next-list" id="next-list"></ol>
+      <button class="link view-all" id="view-all" type="button">View all tickets</button>
     </section>
 
-    <section class="projects" aria-labelledby="projects-title">
+    <section class="all-tickets" id="all-tickets" aria-labelledby="all-title" hidden>
+      <div class="projects-head">
+        <h2 id="all-title">All tickets</h2>
+        <button class="link" id="back-projects" type="button">Back to projects</button>
+      </div>
+      <div class="filters" id="ticket-filters"></div>
+      <div class="table-wrap" id="ticket-table"></div>
+    </section>
+
+    <section class="projects" id="projects" aria-labelledby="projects-title">
       <div class="projects-head">
         <h2 id="projects-title">Projects</h2>
         <label class="closed-toggle"><input type="checkbox" id="show-closed"> Show done and canceled</label>
