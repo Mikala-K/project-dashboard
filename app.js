@@ -1,22 +1,26 @@
 // Project Dashboard front end. Data comes from the n8n webhooks; the Google Sheet is the database.
+// In the sheet and webhooks a task is stored as a "ticket" row; on the page everything is called a task.
 const API = 'https://n8n.wippdata.com/webhook/wipp-dashboard';
 const CLOSED = ['Done', 'Canceled'];
+const LIVE = ['Active', 'Maintenance', 'Ramping up'];
 const STATUS_ORDER = ['Active', 'Maintenance', 'Ramping up', 'On hold', 'Prospect', 'Done', 'Canceled'];
 const PROJECT_STATUSES = ['Prospect', 'Ramping up', 'Active', 'On hold', 'Maintenance', 'Done', 'Canceled'];
-const TICKET_STATUSES = ['Open', 'In progress', 'Blocked', 'Backlog'];
+const TASK_STATUSES = ['Open', 'In progress', 'Blocked', 'Backlog'];
+const PRIORITY_RANK = { High: 0, Medium: 1, Low: 2 };
+const TASK_STATUS_RANK = { 'In progress': 0, Open: 1, Blocked: 2, Backlog: 3 };
+const UP_NEXT_COUNT = 5;
 const KEY_STORE = 'pd_key';
 
 const $ = (id) => document.getElementById(id);
-const state = { data: null, client: 'all', showClosed: false, openProjects: new Set(), view: 'projects',
-  sort: { key: 'ticket_id', dir: 1 }, filter: { project: '', assignee: '', category: '' }, expanded: new Set() };
+const state = {
+  data: null, client: 'all', showClosed: false, ticketing: false,
+  openCards: new Set(), openTasks: new Set(),
+  sort: { key: 'priority', dir: 1 }, filter: { project: '', assignee: '', category: '' }, logProject: '',
+};
 
 // ---------- key handling ----------
-function storedKey() {
-  try { return localStorage.getItem(KEY_STORE) || ''; } catch (e) { return ''; }
-}
-function saveKey(k) {
-  try { localStorage.setItem(KEY_STORE, k); } catch (e) { /* private mode: key lives in the URL only */ }
-}
+function storedKey() { try { return localStorage.getItem(KEY_STORE) || ''; } catch (e) { return ''; } }
+function saveKey(k) { try { localStorage.setItem(KEY_STORE, k); } catch (e) { /* private mode: key stays in the URL */ } }
 function currentKey() {
   const fromUrl = new URLSearchParams(location.search).get('key');
   if (fromUrl) { saveKey(fromUrl); return fromUrl; }
@@ -41,13 +45,15 @@ function el(tag, attrs = {}, ...kids) {
 }
 const split = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
 const status = (msg) => { $('status-line').textContent = msg || ''; };
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const idNum = (id) => Number(String(id || '').replace(/\D/g, '')) || 0;
+const statusRank = (s) => { const i = STATUS_ORDER.indexOf(s); return i < 0 ? 99 : i; };
 const toIso = (v) => {
   const s = String(v || '').trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
   const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   return m ? `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}` : '';
 };
-const rank = (s) => { const i = STATUS_ORDER.indexOf(s); return i < 0 ? 99 : i; };
 
 // Sends JSON. If the browser blocks it (cross-site check), retries as plain text, which n8n still reads as JSON text.
 async function post(path, payload) {
@@ -60,6 +66,41 @@ async function post(path, payload) {
   return out;
 }
 
+// ---------- data lookups ----------
+const projectOf = (id) => state.data.projects.find((x) => x.project_id === id);
+const projectName = (id) => (projectOf(id) || {}).display_name || id;
+const clientOf = (p) => state.data.clients.find((c) => c.client === (p || {}).client) || {};
+const isSecondary = (p) => clientOf(p).relationship === 'Internal';
+const openIds = () => new Set(state.data.tickets.map((t) => t.ticket_id));
+const subtasksOf = (t) => state.data.tickets.filter((k) => k.parent_ticket === t.ticket_id);
+const isTopLevel = (t, ids = openIds()) => !t.parent_ticket || !ids.has(t.parent_ticket);
+const tasksOfProject = (id) => state.data.tickets.filter((t) => t.project === id);
+
+// Primary client projects that are live come first, then live WIPP projects, then everything on hold or not started
+function projectGroup(p) {
+  if (!p) return 3;
+  if (!LIVE.includes(p.status)) return 2;
+  return isSecondary(p) ? 1 : 0;
+}
+
+function upNext() {
+  const d = state.data;
+  const ids = openIds();
+  const me = d.user.name;
+  return d.tickets
+    .filter((t) => t.status !== 'Backlog' && split(t.assignee).includes(me))
+    .filter((t) => isTopLevel(t, ids) || t.priority === 'High')
+    .sort((a, b) => {
+      const pa = projectOf(a.project); const pb = projectOf(b.project);
+      return (PRIORITY_RANK[a.priority] ?? 3) - (PRIORITY_RANK[b.priority] ?? 3)
+        || projectGroup(pa) - projectGroup(pb)
+        || tasksOfProject(b.project).length - tasksOfProject(a.project).length
+        || (toIso(a.due_date) || '9999').localeCompare(toIso(b.due_date) || '9999')
+        || idNum(a.ticket_id) - idNum(b.ticket_id);
+    })
+    .slice(0, UP_NEXT_COUNT);
+}
+
 // ---------- load ----------
 async function load() {
   const key = currentKey();
@@ -70,6 +111,7 @@ async function load() {
     const body = await res.json().catch(() => ({}));
     if (res.status === 401) { showGate('That key did not work. Check your dashboard link.'); status(''); return; }
     if (!res.ok || !body.ok) throw new Error(body.error || `Server answered ${res.status}`);
+    body.log = body.log || [];
     state.data = body;
     $('gate').hidden = true;
     render();
@@ -85,129 +127,143 @@ function showGate(msg) {
   $('gate-key').focus();
 }
 
-// ---------- render ----------
+// ---------- routing ----------
+function route() {
+  const h = location.hash.replace(/^#/, '');
+  if (h.startsWith('project/')) return { view: 'project', id: decodeURIComponent(h.slice(8)) };
+  if (h === 'tasks' || h === 'log') return { view: h };
+  return { view: 'home' };
+}
 function render() {
-  const d = state.data;
-  $('hello').textContent = `Hi ${d.user.name}`;
-  renderNext(d);
-  renderChips(d);
-  renderProjects(d);
-  renderAllTickets(d);
-  showView();
+  if (!state.data) return;
+  const r = route();
+  $('hello').textContent = `Hi ${state.data.user.name}`;
+  for (const v of ['home', 'tasks', 'log', 'project']) $(`view-${v}`).hidden = v !== r.view;
+  const wide = r.view === 'tasks' || r.view === 'log';
+  $('next-section').hidden = wide;
+  $('app').classList.toggle('full', wide);
+  document.querySelectorAll('.tabs a').forEach((a) => a.setAttribute('aria-current', a.dataset.view === r.view ? 'page' : 'false'));
+  renderNext();
+  if (r.view === 'home') { renderChips(); renderProjects(); }
+  if (r.view === 'tasks') renderTasks();
+  if (r.view === 'log') renderLog();
+  if (r.view === 'project') renderProjectPage(r.id);
 }
-function showView() {
-  const tickets = state.view === 'tickets';
-  $('projects').hidden = tickets;
-  $('all-tickets').hidden = !tickets;
-  $('view-all').textContent = tickets ? 'Back to projects' : 'View all tickets';
-}
-const projectOf = (d, id) => d.projects.find((x) => x.project_id === id);
-const projectName = (d, id) => (projectOf(d, id) || {}).display_name || id;
 
-function ticketRow(d, t, showProject) {
-  const blocked = t.status === 'Blocked' || t.blocked_by;
-  return el('li', { class: 'ticket', 'data-priority': t.priority },
+// ---------- task rows (Up next, cards, project page) ----------
+const byStatusThenId = (a, b) => (a.status === 'Backlog') - (b.status === 'Backlog') || idNum(a.ticket_id) - idNum(b.ticket_id);
+
+function taskRow(t, opts = {}) {
+  const kids = opts.withSubtasks ? subtasksOf(t) : [];
+  const expanded = opts.expandAll || state.openTasks.has(t.ticket_id);
+  const meta = [
+    opts.showProject ? projectName(t.project) : null,
+    `${t.priority || 'Low'} priority`,
+    t.due_date ? `Due ${t.due_date}` : null,
+    t.status !== 'Open' ? t.status : null,
+    t.category || null,
+    opts.showAssignee ? (t.assignee || 'Unassigned') : null,
+    t.blocked_by ? `Waiting on ${t.blocked_by}` : null,
+    opts.markSub && t.parent_ticket ? `Subtask of ${t.parent_ticket}` : null,
+  ].filter(Boolean);
+  const li = el('li', { class: 'task', 'data-priority': t.priority },
     el('input', { type: 'checkbox', class: 'tick', 'aria-label': `Check off ${t.task}`, onchange: (e) => { e.target.checked = false; openComplete(t); } }),
-    el('button', { type: 'button', class: 'ticket-open', onclick: () => openTicket({ ticket: t }) },
-      el('span', { class: 'ticket-task' }, t.task),
-      el('span', { class: 'ticket-meta' },
-        showProject ? el('span', {}, projectName(d, t.project)) : null,
-        el('span', {}, `${t.priority || 'Low'} priority`),
-        t.due_date ? el('span', {}, `Due ${t.due_date}`) : null,
-        t.status !== 'Open' ? el('span', {}, t.status) : null,
-        t.category ? el('span', {}, t.category) : null,
-        t.assignee && !showProject ? el('span', {}, t.assignee) : (!t.assignee ? el('span', {}, 'Unassigned') : null),
-        blocked && t.blocked_by ? el('span', {}, `Waiting on ${t.blocked_by}`) : null,
-      ),
+    el('div', {},
+      el('button', { type: 'button', class: 'task-open', onclick: () => openTask({ task: t }) },
+        el('span', { class: 'task-id' }, t.ticket_id), ' ', el('span', { class: 'task-name' }, t.task)),
+      el('span', { class: 'task-meta' }, meta.map((m) => el('span', {}, m))),
+      kids.length && !opts.expandAll ? el('button', {
+        type: 'button', class: 'link sub-toggle', 'aria-expanded': String(expanded),
+        onclick: () => { if (expanded) state.openTasks.delete(t.ticket_id); else state.openTasks.add(t.ticket_id); render(); },
+      }, `${expanded ? 'Hide' : 'Show'} ${plural(kids.length, 'subtask')}`) : null,
     ),
   );
-}
-
-function renderNext(d) {
-  const list = $('next-list');
-  list.replaceChildren();
-  if (!d.my_top5.length) {
-    list.append(el('li', { class: 'next-empty' }, 'Nothing is assigned to you right now. Use New ticket to add one.'));
-    return;
+  if (kids.length && expanded) {
+    li.append(el('ul', { class: 'task-list sub' }, kids.sort(byStatusThenId).map((k) => taskRow(k, { showAssignee: true }))));
   }
-  for (const t of d.my_top5) list.append(ticketRow(d, t, true));
+  return li;
 }
 
-function renderChips(d) {
-  const box = $('client-chips');
-  box.replaceChildren();
+function renderNext() {
+  const items = upNext();
+  $('next-list').replaceChildren(...(items.length
+    ? items.map((t) => taskRow(t, { showProject: true, markSub: true }))
+    : [el('li', { class: 'next-empty' }, 'Nothing is assigned to you right now. Use New task to add one.')]));
+}
+
+// ---------- dashboard ----------
+function renderChips() {
+  const d = state.data;
   const make = (value, label) => el('button', {
     class: 'chip', type: 'button', 'aria-pressed': String(state.client === value),
-    onclick: () => { state.client = value; renderChips(d); renderProjects(d); },
+    onclick: () => { state.client = value; render(); },
   }, label);
-  box.append(make('all', 'All clients'));
-  for (const c of d.clients) box.append(make(c.client, c.client));
+  $('client-chips').replaceChildren(make('all', 'All clients'), ...d.clients.map((c) => make(c.client, c.client)));
 }
 
-function renderProjects(d) {
+function sortProjects(list) {
+  return list.sort((a, b) => statusRank(a.status) - statusRank(b.status)
+    || isSecondary(a) - isSecondary(b)
+    || tasksOfProject(b.project_id).length - tasksOfProject(a.project_id).length
+    || a.display_name.localeCompare(b.display_name));
+}
+
+function renderProjects() {
+  const d = state.data;
   const wrap = $('project-groups');
   wrap.replaceChildren();
-  if (new URLSearchParams(location.search).get('preview') === 'maintenance') wrap.append(...maintenancePreview(d));
-
-  const projects = d.projects
-    .filter((p) => state.client === 'all' || p.client === state.client)
-    .filter((p) => state.showClosed || !CLOSED.includes(p.status))
-    .sort((a, b) => rank(a.status) - rank(b.status) || a.display_name.localeCompare(b.display_name));
-
+  if (new URLSearchParams(location.search).get('preview') === 'maintenance') wrap.append(...maintenancePreview());
   if (state.client !== 'all') {
     const c = d.clients.find((x) => x.client === state.client);
     if (c) wrap.append(el('p', { class: 'client-line' }, el('strong', {}, c.company_name || c.client), c.primary_contacts ? `Contacts: ${c.primary_contacts}` : null));
   }
+  const projects = sortProjects(d.projects
+    .filter((p) => state.client === 'all' || p.client === state.client)
+    .filter((p) => state.showClosed || !CLOSED.includes(p.status)));
   if (!projects.length) wrap.append(el('p', { class: 'meter-empty' }, 'No open projects here. Tick "Show done and canceled" to see the rest.'));
-  for (const p of projects) wrap.append(projectCard(d, p));
+  for (const p of projects) wrap.append(projectCard(p));
 }
 
-function projectCard(d, p) {
-  const tickets = d.tickets.filter((t) => t.project === p.project_id);
-  const isOpen = state.openProjects.has(p.project_id);
-  const facts = [];
-  if (p.open_tickets) facts.push(`${p.open_tickets} open ticket${p.open_tickets === 1 ? '' : 's'}`);
-  if (p.members) facts.push(`Team: ${p.members}`);
+function taskCounts(projectId) {
+  const tasks = tasksOfProject(projectId);
+  const ids = new Set(tasks.map((t) => t.ticket_id));
+  const top = tasks.filter((t) => isTopLevel(t, ids)).length;
+  const sub = tasks.length - top;
+  if (!tasks.length) return '';
+  return sub ? `${plural(sub, 'open subtask')} from ${plural(top, 'open task')}` : plural(top, 'open task');
+}
 
-  const toggle = () => {
-    if (isOpen) state.openProjects.delete(p.project_id); else state.openProjects.add(p.project_id);
-    renderProjects(d);
-  };
-
+function projectCard(p) {
+  const open = state.openCards.has(p.project_id);
+  const tasks = tasksOfProject(p.project_id);
+  const ids = new Set(tasks.map((t) => t.ticket_id));
+  const top = tasks.filter((t) => isTopLevel(t, ids)).sort(byStatusThenId);
+  const facts = [taskCounts(p.project_id), p.members ? `Team: ${p.members}` : ''].filter(Boolean);
+  const isPreview = String(p.project_id).startsWith('preview');
   return el('article', { class: `project${CLOSED.includes(p.status) ? ' closed' : ''}` },
-    el('h3', {}, p.display_name),
+    el('h3', {}, isPreview ? p.display_name : el('a', { href: `#project/${encodeURIComponent(p.project_id)}`, class: 'project-link' }, p.display_name)),
     el('span', { class: 'project-status', 'data-status': p.status }, p.status),
     el('div', { class: 'project-body' },
       p.notes ? el('p', { class: 'project-note' }, p.notes) : null,
       p.status === 'Maintenance' ? maintenanceRow(p) : meter(p),
       facts.length ? el('div', { class: 'project-facts' }, facts.map((f) => el('span', {}, f))) : null,
       split(p.tools).length ? el('div', { class: 'tags', 'aria-label': 'Tools' }, split(p.tools).map((t) => el('span', { class: 'tag' }, t))) : null,
-      el('div', { class: 'card-actions' },
-        el('button', { type: 'button', class: 'link', 'aria-expanded': String(isOpen), onclick: toggle }, isOpen ? 'Hide tickets' : `Show tickets (${tickets.length})`),
-        el('button', { type: 'button', class: 'link', onclick: () => openTicket({ project: p.project_id }) }, 'Add ticket'),
-        el('button', { type: 'button', class: 'link', onclick: () => openProject(p) }, 'Edit project'),
+      isPreview ? null : el('div', { class: 'card-actions' },
+        el('button', { type: 'button', class: 'link', 'aria-expanded': String(open), onclick: () => {
+          if (open) state.openCards.delete(p.project_id); else state.openCards.add(p.project_id);
+          render();
+        } }, open ? 'Hide tasks' : `Show tasks (${top.length})`),
+        el('button', { type: 'button', class: 'link', onclick: () => openTask({ project: p.project_id }) }, 'Add task'),
+        el('a', { class: 'link', href: `#project/${encodeURIComponent(p.project_id)}` }, 'Open project'),
       ),
-      isOpen ? ticketTree(d, tickets) : null,
+      open ? (top.length ? el('ul', { class: 'task-list' }, top.map((t) => taskRow(t, { withSubtasks: true, showAssignee: true })))
+        : el('p', { class: 'meter-empty' }, 'No open tasks on this project.')) : null,
     ),
   );
 }
 
-// Parent tickets with their subtasks tucked underneath
-function ticketTree(d, tickets) {
-  if (!tickets.length) return el('p', { class: 'meter-empty' }, 'No open tickets on this project.');
-  const ids = new Set(tickets.map((t) => t.ticket_id));
-  const tops = tickets.filter((t) => !t.parent_ticket || !ids.has(t.parent_ticket));
-  const order = (a, b) => (a.status === 'Backlog') - (b.status === 'Backlog');
-  return el('ul', { class: 'ticket-list' }, tops.sort(order).map((t) => {
-    const kids = tickets.filter((k) => k.parent_ticket === t.ticket_id);
-    const row = ticketRow(d, t, false);
-    if (kids.length) row.append(el('ul', { class: 'ticket-list sub' }, kids.sort(order).map((k) => ticketRow(d, k, false))));
-    return row;
-  }));
-}
-
-// One block per milestone; each block fills by its own tickets and locks full when the milestone is Done.
-function meter(p, compact) {
+// One block per milestone; each block fills by its own tasks and locks full when the milestone is Done.
+function meter(p) {
   if (p.segments && p.segments.length) {
     const current = p.segments.find((s) => s.status !== 'Done');
     return el('div', { class: 'meter-wrap' },
@@ -217,7 +273,7 @@ function meter(p, compact) {
           style: `flex: ${s.share} 1 0`, title: `${s.milestone}: ${Math.round(s.fill * 100)}%`,
         }, el('div', { class: 'seg-fill', style: `width: ${Math.round(s.fill * 100)}%` }))),
       ),
-      compact ? null : el('div', { class: 'meter-labels' },
+      el('div', { class: 'meter-labels' },
         el('span', {}, current ? `Now: ${current.milestone}` : 'All milestones done'),
         el('span', { class: 'meter-pct' }, `${p.progress}%`),
       ),
@@ -227,10 +283,10 @@ function meter(p, compact) {
     return el('div', { class: 'meter-wrap' },
       el('div', { class: 'meter', role: 'img', 'aria-label': `${p.progress}% complete` },
         el('div', { class: 'seg', style: 'flex: 1 1 0' }, el('div', { class: 'seg-fill', style: `width: ${p.progress}%` }))),
-      compact ? null : el('div', { class: 'meter-labels' }, el('span', {}, 'Set by hand'), el('span', { class: 'meter-pct' }, `${p.progress}%`)),
+      el('div', { class: 'meter-labels' }, el('span', {}, 'Set by hand'), el('span', { class: 'meter-pct' }, `${p.progress}%`)),
     );
   }
-  return compact ? null : el('p', { class: 'meter-empty' }, 'No milestones yet');
+  return el('p', { class: 'meter-empty' }, 'No milestones yet');
 }
 
 // ---------- maintenance ----------
@@ -246,7 +302,6 @@ const STAGES = [
   [0, 'cruise', 'Cruising', 'Check in weekly to monthly. Earning with very little upkeep.'],
 ];
 const stageFor = (load) => STAGES.find(([min]) => load >= min);
-
 function gauge(load) {
   const [, stage, label] = stageFor(load);
   return el('div', { class: 'gauge', 'data-stage': stage, role: 'img', 'aria-label': `Maintenance load ${Math.round(load * 100)}%, ${label}` },
@@ -260,108 +315,193 @@ function maintenanceRow(p) {
   return el('div', { class: 'maint' },
     el('div', { class: 'maint-done' },
       el('div', { class: 'maint-arrow' }, el('span', {}, 'Complete')),
-      el('p', { class: 'maint-caption' }, `${phase} complete, in maintenance mode`),
-    ),
-    el('div', { class: 'maint-gauge' },
-      gauge(load),
-      el('div', { class: 'gauge-text' }, el('strong', {}, label), detail),
-    ),
+      el('p', { class: 'maint-caption' }, `${phase} complete, in maintenance mode`)),
+    el('div', { class: 'maint-gauge' }, gauge(load), el('div', { class: 'gauge-text' }, el('strong', {}, label), detail)),
   );
 }
-function maintenancePreview(d) {
-  const base = projectOf(d, 'P-001') || { segments: [] };
-  return [0.6, 0.35, 0.15, 0.05].map((load) => projectCard(d, {
+function maintenancePreview() {
+  const base = projectOf('P-001') || { segments: [] };
+  return [0.6, 0.35, 0.15, 0.05].map((load) => projectCard({
     ...base, project_id: `preview-${load}`, display_name: `Preview - ${stageFor(load)[2]}`,
     status: 'Maintenance', notes: 'Sample card, only shown with the preview link', weekly_hours: load * 40,
     open_tickets: 0, tools: '', members: '',
   }));
 }
 
+// ---------- project page ----------
+function renderProjectPage(id) {
+  const d = state.data;
+  const view = $('view-project');
+  const p = projectOf(id);
+  if (!p) { view.replaceChildren(el('p', {}, 'That project was not found. ', el('a', { href: '#' }, 'Back to the dashboard'))); return; }
+  const c = clientOf(p);
+  const tasks = tasksOfProject(id);
+  const ids = new Set(tasks.map((t) => t.ticket_id));
+  const top = tasks.filter((t) => isTopLevel(t, ids)).sort(byStatusThenId);
+  const milestones = d.milestones.filter((m) => m.project_id === id);
+  const log = d.log.filter((l) => l.project === id);
+  const fact = (label, value) => (value ? [el('dt', {}, label), el('dd', {}, value)] : []);
+  const dates = [p.start_date, p.end_date].filter(Boolean).join(' to ');
+  const hours = [p.allocated_hours ? `${p.allocated_hours} allocated` : '', p.weekly_hours ? `${p.weekly_hours} per week` : ''].filter(Boolean).join(', ');
 
-// ---------- all tickets ----------
-const idNum = (id) => Number(String(id || '').replace(/\D/g, '')) || 0;
-const PRIORITY_RANK = { High: 0, Medium: 1, Low: 2 };
-const TICKET_STATUS_RANK = { 'In progress': 0, Open: 1, Blocked: 2, Backlog: 3 };
+  view.replaceChildren(
+    el('a', { href: '#', class: 'link back' }, 'Back to the dashboard'),
+    el('div', { class: 'page-head' },
+      el('h2', {}, p.display_name),
+      el('span', { class: 'project-status', 'data-status': p.status }, p.status)),
+    p.notes ? el('p', { class: 'page-note' }, p.notes) : null,
+    el('div', { class: 'page-grid' },
+      el('div', { class: 'panel' },
+        el('h3', {}, 'Progress'),
+        p.status === 'Maintenance' ? maintenanceRow(p) : meter(p),
+        milestones.length ? el('ol', { class: 'milestones' }, milestones.map((m) => el('li', { 'data-status': m.status },
+          el('strong', {}, m.milestone), el('span', {}, [m.status, m.target_date ? `target ${m.target_date}` : ''].filter(Boolean).join(', '))))) : null),
+      el('div', { class: 'panel' },
+        el('h3', {}, 'Details'),
+        el('dl', { class: 'facts' },
+          fact('Client', [c.company_name || p.client, c.primary_contacts ? ` (${c.primary_contacts})` : ''].join('')),
+          fact('Owner', p.owner), fact('Team', p.members), fact('Timeframe', dates), fact('Hours', hours),
+          fact('Categories', p.categories), fact('Tools', p.tools)),
+        el('button', { type: 'button', class: 'link', onclick: () => openProject(p) }, 'Edit project')),
+    ),
+    el('div', { class: 'panel' },
+      el('div', { class: 'projects-head' },
+        el('h3', {}, `Tasks${tasks.length ? ` (${taskCounts(id)})` : ''}`),
+        el('button', { type: 'button', class: 'link', onclick: () => openTask({ project: id }) }, 'Add task')),
+      top.length ? el('ul', { class: 'task-list' }, top.map((t) => taskRow(t, { withSubtasks: true, expandAll: true, showAssignee: true })))
+        : el('p', { class: 'meter-empty' }, 'No open tasks on this project.')),
+    el('div', { class: 'panel' },
+      el('h3', {}, 'Log'),
+      log.length ? logList(log, false) : el('p', { class: 'meter-empty' }, 'Checked-off tasks for this project will show up here.')),
+  );
+}
+
+// ---------- all tasks (list and ticketing mode) ----------
 const COLUMNS = [
   ['ticket_id', 'ID', (t) => idNum(t.ticket_id)],
   ['task', 'Task', (t) => t.task.toLowerCase()],
-  ['project', 'Project', (t) => projectName(state.data, t.project)],
+  ['project', 'Project', (t) => projectName(t.project)],
   ['category', 'Category', (t) => (t.category || '~').toLowerCase()],
   ['assignee', 'Assignee', (t) => t.assignee || '~'],
   ['priority', 'Priority', (t) => PRIORITY_RANK[t.priority] ?? 3],
-  ['status', 'Status', (t) => TICKET_STATUS_RANK[t.status] ?? 9],
+  ['status', 'Status', (t) => TASK_STATUS_RANK[t.status] ?? 9],
+  ['milestone_id', 'Milestone', (t) => t.milestone_id || '~'],
   ['due_date', 'Due', (t) => toIso(t.due_date) || '9999'],
 ];
 
-function renderAllTickets(d) {
+async function quickSave(t, key, value) {
+  try {
+    status('Saving…');
+    await post('ticket/update', { ticket_id: t.ticket_id, [key]: value });
+    await load();
+    status('Saved');
+    setTimeout(() => status(''), 1500);
+  } catch (ex) { status(`Could not save: ${ex.message}`); }
+}
+
+function renderTasks() {
+  const d = state.data;
   const f = state.filter;
-  const filters = $('ticket-filters');
   const sel = (key, label, options) => field(label, el('select', {
-    onchange: (e) => { f[key] = e.target.value; renderAllTickets(d); },
+    onchange: (e) => { f[key] = e.target.value; render(); },
   }, options.map(([v, l]) => el('option', { value: v, selected: f[key] === v }, l))));
   const cats = [...new Set(d.tickets.map((t) => t.category).filter(Boolean))].sort();
-  filters.replaceChildren(
-    sel('project', 'Project', [['', 'All projects'], ...d.projects.filter((p) => d.tickets.some((t) => t.project === p.project_id)).map((p) => [p.project_id, p.display_name])]),
+  $('task-filters').replaceChildren(
+    sel('project', 'Project', [['', 'All projects'], ...sortProjects(d.projects.filter((p) => tasksOfProject(p.project_id).length)).map((p) => [p.project_id, p.display_name])]),
     sel('assignee', 'Assignee', [['', 'Everyone'], ['-', 'Unassigned'], ...d.people.map((n) => [n, n])]),
     sel('category', 'Category', [['', 'All categories'], ...cats.map((c) => [c, c])]),
   );
+  $('ticketing').checked = state.ticketing;
 
-  const ids = new Set(d.tickets.map((t) => t.ticket_id));
+  const ids = openIds();
   const match = (t) => (!f.project || t.project === f.project)
     && (!f.assignee || (f.assignee === '-' ? !t.assignee : split(t.assignee).includes(f.assignee)))
     && (!f.category || t.category === f.category);
-  const kidsOf = (t) => d.tickets.filter((k) => k.parent_ticket === t.ticket_id);
-  // A parent stays visible when any of its subtasks match the filters
-  const tops = d.tickets.filter((t) => !t.parent_ticket || !ids.has(t.parent_ticket))
-    .filter((t) => match(t) || kidsOf(t).some(match));
+  const tops = d.tickets.filter((t) => isTopLevel(t, ids)).filter((t) => match(t) || subtasksOf(t).some(match));
   const [, , keyFn] = COLUMNS.find(([k]) => k === state.sort.key);
   const cmp = (a, b) => {
     const x = keyFn(a); const y = keyFn(b);
     return (x < y ? -1 : x > y ? 1 : 0) * state.sort.dir || idNum(a.ticket_id) - idNum(b.ticket_id);
   };
+  const columns = state.ticketing ? COLUMNS : COLUMNS.filter(([k]) => k !== 'milestone_id');
 
-  const head = el('tr', {}, COLUMNS.map(([k, label]) => {
+  const head = el('tr', {}, columns.map(([k, label]) => {
     const active = state.sort.key === k;
     return el('th', { scope: 'col', 'aria-sort': active ? (state.sort.dir === 1 ? 'ascending' : 'descending') : 'none' },
       el('button', { type: 'button', class: 'sort', onclick: () => {
         state.sort = { key: k, dir: active ? -state.sort.dir : 1 };
-        renderAllTickets(d);
+        render();
       } }, label, active ? (state.sort.dir === 1 ? ' ▲' : ' ▼') : ''));
   }), el('th', { scope: 'col' }, el('span', { class: 'sr-only' }, 'Check off')));
 
+  const pick = (t, key, options, label) => el('select', {
+    class: 'inline-select', 'aria-label': `${label} for ${t.ticket_id}`,
+    onchange: (e) => quickSave(t, key, e.target.value),
+  }, options.map(([v, l]) => el('option', { value: v, selected: String(t[key] || '') === String(v) }, l)));
+
   const row = (t, isSub) => {
-    const kids = isSub ? [] : kidsOf(t);
-    const open = state.expanded.has(t.ticket_id);
-    const assign = el('select', { class: 'inline-select', 'aria-label': `Assignee for ${t.ticket_id}`, onchange: async (e) => {
-      try { status('Saving…'); await post('ticket/update', { ticket_id: t.ticket_id, assignee: e.target.value }); await load(); status('Assignee saved'); }
-      catch (ex) { status(`Could not save: ${ex.message}`); }
-    } }, [['', 'Unassigned'], ...d.people.map((n) => [n, n])].map(([v, l]) => el('option', { value: v, selected: (t.assignee || '') === v }, l)));
-    return el('tr', { class: isSub ? 'sub-row' : '', 'data-priority': t.priority },
-      el('td', { class: 'id-cell' }, t.ticket_id),
-      el('td', { class: 'task-cell' },
-        el('button', { type: 'button', class: 'ticket-open', onclick: () => openTicket({ ticket: t }) }, el('span', { class: 'ticket-task' }, t.task)),
+    const kids = isSub ? [] : subtasksOf(t);
+    const open = state.openTasks.has(t.ticket_id);
+    const p = projectOf(t.project) || {};
+    const cells = {
+      ticket_id: el('td', { class: 'id-cell' }, t.ticket_id),
+      task: el('td', { class: 'task-cell' },
+        el('button', { type: 'button', class: 'task-open', onclick: () => openTask({ task: t }) }, el('span', { class: 'task-name' }, t.task)),
         kids.length ? el('button', { type: 'button', class: 'link sub-toggle', 'aria-expanded': String(open), onclick: () => {
-          if (open) state.expanded.delete(t.ticket_id); else state.expanded.add(t.ticket_id);
-          renderAllTickets(d);
-        } }, `${open ? 'Hide' : 'Show'} ${kids.length} subtask${kids.length === 1 ? '' : 's'}`) : null),
-      el('td', {}, projectName(d, t.project)),
-      el('td', {}, t.category || ''),
-      el('td', {}, assign),
-      el('td', {}, el('span', { class: 'pill', 'data-priority': t.priority }, t.priority || 'Low')),
-      el('td', {}, t.status),
-      el('td', { class: 'nowrap' }, t.due_date || ''),
-      el('td', {}, el('input', { type: 'checkbox', class: 'tick', 'aria-label': `Check off ${t.task}`, onchange: (e) => { e.target.checked = false; openComplete(t); } })),
-    );
+          if (open) state.openTasks.delete(t.ticket_id); else state.openTasks.add(t.ticket_id);
+          render();
+        } }, `${open ? 'Hide' : 'Show'} ${plural(kids.length, 'subtask')}`) : null),
+      project: el('td', {}, state.ticketing
+        ? pick(t, 'project', sortProjects([...d.projects]).map((x) => [x.project_id, x.display_name]), 'Project')
+        : projectName(t.project)),
+      category: el('td', {}, state.ticketing
+        ? [el('input', { class: 'inline-select', value: t.category || '', list: `cats-${t.ticket_id}`, 'aria-label': `Category for ${t.ticket_id}`,
+          onchange: (e) => quickSave(t, 'category', e.target.value) }),
+        el('datalist', { id: `cats-${t.ticket_id}` }, split(p.categories).map((c) => el('option', { value: c })))]
+        : (t.category || '')),
+      assignee: el('td', {}, state.ticketing ? pick(t, 'assignee', [['', 'Unassigned'], ...d.people.map((n) => [n, n])], 'Assignee') : (t.assignee || 'Unassigned')),
+      priority: el('td', {}, state.ticketing ? pick(t, 'priority', [['High', 'High'], ['Medium', 'Medium'], ['Low', 'Low']], 'Priority')
+        : el('span', { class: 'pill', 'data-priority': t.priority }, t.priority || 'Low')),
+      status: el('td', {}, state.ticketing ? pick(t, 'status', TASK_STATUSES.map((s) => [s, s]), 'Status') : t.status),
+      milestone_id: el('td', {}, pick(t, 'milestone_id', [['', 'None'], ...d.milestones.filter((m) => m.project_id === t.project).map((m) => [m.milestone_id, m.milestone])], 'Milestone')),
+      due_date: el('td', { class: 'nowrap' }, t.due_date || ''),
+    };
+    return el('tr', { class: isSub ? 'sub-row' : '' },
+      columns.map(([k]) => cells[k]),
+      el('td', {}, el('input', { type: 'checkbox', class: 'tick', 'aria-label': `Check off ${t.task}`, onchange: (e) => { e.target.checked = false; openComplete(t); } })));
   };
 
   const rows = [];
   for (const t of tops.sort(cmp)) {
     rows.push(row(t, false));
-    if (state.expanded.has(t.ticket_id)) for (const k of kidsOf(t).sort(cmp)) rows.push(row(k, true));
+    if (state.openTasks.has(t.ticket_id)) for (const k of subtasksOf(t).sort(cmp)) rows.push(row(k, true));
   }
-  $('ticket-table').replaceChildren(rows.length
-    ? el('table', { class: 'tickets-table' }, el('thead', {}, head), el('tbody', {}, rows))
-    : el('p', { class: 'meter-empty' }, 'No open tickets match these filters.'));
+  $('task-table').classList.toggle('ticketing', state.ticketing);
+  $('task-table').replaceChildren(rows.length
+    ? el('table', { class: 'tasks-table' }, el('thead', {}, head), el('tbody', {}, rows))
+    : el('p', { class: 'meter-empty' }, 'No open tasks match these filters.'));
+}
+
+// ---------- log ----------
+function logList(entries, showProject) {
+  return el('ol', { class: 'log-list' }, entries.map((l) => el('li', { class: 'log-item' },
+    el('div', { class: 'log-head' },
+      el('strong', {}, `${l.ticket_id} ${l.task}`),
+      el('span', {}, [l.completed_at, l.completed_by, l.actual_hours ? `${l.actual_hours} h` : ''].filter(Boolean).join(', '))),
+    showProject ? el('p', { class: 'log-project' }, projectName(l.project)) : null,
+    el('dl', { class: 'log-notes' },
+      l.what_was_done ? [el('dt', {}, 'Done'), el('dd', {}, l.what_was_done)] : null,
+      l.what_changed ? [el('dt', {}, 'Changed or found'), el('dd', {}, l.what_changed)] : null,
+      l.next_steps ? [el('dt', {}, 'Next'), el('dd', {}, l.next_steps)] : null),
+  )));
+}
+function renderLog() {
+  const d = state.data;
+  const projects = sortProjects(d.projects.filter((p) => d.log.some((l) => l.project === p.project_id)));
+  $('log-filters').replaceChildren(field('Project', el('select', { onchange: (e) => { state.logProject = e.target.value; render(); } },
+    [['', 'All projects'], ...projects.map((p) => [p.project_id, p.display_name])].map(([v, l]) => el('option', { value: v, selected: state.logProject === v }, l)))));
+  const entries = d.log.filter((l) => !state.logProject || l.project === state.logProject);
+  $('log-list').replaceChildren(entries.length ? logList(entries, true) : el('p', { class: 'meter-empty' }, 'Checked-off tasks show up here with your notes.'));
 }
 
 // ---------- dialogs ----------
@@ -378,8 +518,7 @@ function showDialog(title, formKids, onSave, saveLabel) {
     el('h2', {}, title), ...formKids, err,
     el('div', { class: 'form-actions' },
       el('button', { type: 'button', class: 'secondary', onclick: () => dlg.close() }, 'Cancel'),
-      el('button', { type: 'submit', class: 'primary' }, saveLabel)),
-  );
+      el('button', { type: 'submit', class: 'primary' }, saveLabel)));
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = form.querySelector('.primary');
@@ -389,73 +528,69 @@ function showDialog(title, formKids, onSave, saveLabel) {
       await onSave(values, form);
       dlg.close();
       await load();
-    } catch (ex) {
-      err.textContent = ex.message;
-    } finally { btn.disabled = false; }
+    } catch (ex) { err.textContent = ex.message; } finally { btn.disabled = false; }
   });
   dlg.replaceChildren(form);
   dlg.showModal();
   const first = form.querySelector('input, textarea, select');
   if (first) first.focus();
+  return form;
 }
 
-function openTicket({ ticket, project }) {
+function openTask({ task, project }) {
   const d = state.data;
-  const t = ticket || {};
+  const t = task || {};
   const projId = t.project || project || '';
-  const p = projectOf(d, projId) || {};
+  const p = projectOf(projId) || {};
   const people = [['', 'Unassigned'], ...d.people.map((n) => [n, n])];
-  const projects = [['', 'Choose a project'], ...[...d.projects].sort((a, b) => rank(a.status) - rank(b.status)).map((x) => [x.project_id, x.display_name])];
-  const milestones = [['', 'None'], ...d.milestones.filter((m) => m.project_id === projId).map((m) => [m.milestone_id, m.milestone])];
-  const parents = [['', 'None (top-level ticket)'], ...d.tickets.filter((x) => x.project === projId && x.ticket_id !== t.ticket_id).map((x) => [x.ticket_id, `${x.ticket_id} ${x.task}`])];
+  const projects = [['', 'Choose a project'], ...sortProjects([...d.projects]).map((x) => [x.project_id, x.display_name])];
+  const msOpts = (id) => [['', 'None'], ...d.milestones.filter((m) => m.project_id === id).map((m) => [m.milestone_id, m.milestone])];
+  const parentOpts = (id) => [['', 'None (main task)'], ...d.tickets.filter((x) => x.project === id && x.ticket_id !== t.ticket_id && !x.parent_ticket).map((x) => [x.ticket_id, `${x.ticket_id} ${x.task}`])];
   const cats = el('datalist', { id: 'cat-list' }, split(p.categories).map((c) => el('option', { value: c })));
 
-  const kids = [
+  const form = showDialog(task ? `Edit ${t.ticket_id}` : 'New task', [
     field('Task', el('input', { name: 'task', required: true, value: t.task || '' })),
     field('Description', el('textarea', { name: 'description', rows: 2 }, t.description || '')),
     el('div', { class: 'row' },
       field('Project', select('project', projects, projId)),
       field('Category', el('input', { name: 'category', list: 'cat-list', value: t.category || '' }), 'Like Xano, Softr, G Sheets')),
     el('div', { class: 'row' },
-      field('Assignee', select('assignee', people, t.assignee ?? (ticket ? '' : d.user.name))),
+      field('Assignee', select('assignee', people, t.assignee ?? (task ? '' : d.user.name))),
       field('Priority', select('priority', [['High', 'High'], ['Medium', 'Medium'], ['Low', 'Low']], t.priority || 'Low')),
-      field('Status', select('status', TICKET_STATUSES.map((s) => [s, s]), t.status || 'Open'))),
+      field('Status', select('status', TASK_STATUSES.map((s) => [s, s]), t.status || 'Open'))),
     el('div', { class: 'row' },
       field('Due date', el('input', { name: 'due_date', type: 'date', value: toIso(t.due_date) })),
       field('Estimated hours', el('input', { name: 'est_hours', type: 'number', min: 0, step: 0.25, value: t.est_hours || '' }))),
     el('div', { class: 'row' },
-      field('Milestone', select('milestone_id', milestones, t.milestone_id)),
-      field('Subtask of', select('parent_ticket', parents, t.parent_ticket))),
-    field('Blocked by', el('input', { name: 'blocked_by', value: t.blocked_by || '' }), 'Ticket IDs, like T-004'),
+      field('Milestone', select('milestone_id', msOpts(projId), t.milestone_id)),
+      field('Subtask of', select('parent_ticket', parentOpts(projId), t.parent_ticket))),
+    field('Blocked by', el('input', { name: 'blocked_by', value: t.blocked_by || '' }), 'Task IDs, like T-004'),
     field('Notes', el('textarea', { name: 'notes', rows: 2 }, t.notes || '')),
     cats,
-  ];
-  showDialog(ticket ? `Edit ${t.ticket_id}` : 'New ticket', kids, async (v) => {
-    if (ticket) await post('ticket/update', { ticket_id: t.ticket_id, ...v });
+  ], async (v) => {
+    if (task) await post('ticket/update', { ticket_id: t.ticket_id, ...v });
     else await post('ticket', v);
-    status(ticket ? 'Ticket saved' : 'Ticket added');
-  }, ticket ? 'Save ticket' : 'Add ticket');
+    status(task ? 'Task saved' : 'Task added');
+  }, task ? 'Save task' : 'Add task');
 
-  // Picking a different project refreshes its milestones, possible parent tickets and categories
-  const form = $('dialog').querySelector('form');
+  // Picking a different project refreshes its milestones, possible parent tasks and categories
   form.elements.project.addEventListener('change', (e) => {
     const id = e.target.value;
-    const fill = (sel, opts) => sel.replaceChildren(...opts.map(([v, l]) => el('option', { value: v }, l)));
-    fill(form.elements.milestone_id, [['', 'None'], ...d.milestones.filter((m) => m.project_id === id).map((m) => [m.milestone_id, m.milestone])]);
-    fill(form.elements.parent_ticket, [['', 'None (top-level ticket)'], ...d.tickets.filter((x) => x.project === id && x.ticket_id !== t.ticket_id).map((x) => [x.ticket_id, `${x.ticket_id} ${x.task}`])]);
-    $('cat-list').replaceChildren(...split((projectOf(d, id) || {}).categories).map((c) => el('option', { value: c })));
+    const fill = (s, opts) => s.replaceChildren(...opts.map(([v, l]) => el('option', { value: v }, l)));
+    fill(form.elements.milestone_id, msOpts(id));
+    fill(form.elements.parent_ticket, parentOpts(id));
+    $('cat-list').replaceChildren(...split((projectOf(id) || {}).categories).map((c) => el('option', { value: c })));
   });
 }
 
 function openComplete(t) {
-  const kids = [
-    el('p', { class: 'form-sub' }, t.task),
+  showDialog('Check off task', [
+    el('p', { class: 'form-sub' }, `${t.ticket_id} ${t.task}`),
     field('What was done', el('textarea', { name: 'what_was_done', rows: 3, required: true })),
     field('What changed or was found', el('textarea', { name: 'what_changed', rows: 2 })),
-    field('What to add next', el('textarea', { name: 'next_steps', rows: 2 })),
+    field('What to add next', el('textarea', { name: 'next_steps', rows: 2 }), 'A note for the log. It does not create a new task'),
     field('Hours spent', el('input', { name: 'actual_hours', type: 'number', min: 0, step: 0.25, value: t.actual_hours || '' })),
-  ];
-  showDialog('Check off ticket', kids, async (v) => {
+  ], async (v) => {
     await post('ticket/update', { ticket_id: t.ticket_id, complete: v });
     status('Checked off and saved to the log');
   }, 'Check off');
@@ -465,7 +600,7 @@ function openProject(p) {
   const d = state.data;
   const x = p || {};
   const memberSet = new Set(split(x.members));
-  const kids = [
+  showDialog(p ? `Edit ${x.display_name}` : 'New project', [
     el('div', { class: 'row' },
       field('Client', select('client', d.clients.map((c) => [c.client, c.client]), x.client || '')),
       field('Project name', el('input', { name: 'project', required: true, value: x.project || '' }))),
@@ -475,13 +610,15 @@ function openProject(p) {
     el('fieldset', { class: 'field members' }, el('legend', { class: 'field-label' }, 'Members'),
       d.people.map((n) => el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'm', value: n, checked: p ? memberSet.has(n) : n === d.user.name }), n))),
     field('Tools', el('input', { name: 'tools', value: x.tools || '' }), 'Comma separated, like n8n, G Sheets, Claude TBD'),
-    field('Categories', el('input', { name: 'categories', value: x.categories || '' }), 'Parts tickets get sorted into, like Softr front end, Xano back end'),
+    field('Categories', el('input', { name: 'categories', value: x.categories || '' }), 'Parts tasks get sorted into, like Softr front end, Xano back end'),
+    el('div', { class: 'row' },
+      field('Start date', el('input', { name: 'start_date', type: 'date', value: toIso(x.start_date) })),
+      field('End date', el('input', { name: 'end_date', type: 'date', value: toIso(x.end_date) }))),
     el('div', { class: 'row' },
       field('Allocated hours', el('input', { name: 'allocated_hours', type: 'number', min: 0, step: 0.5, value: x.allocated_hours || '' })),
       field('Weekly hours', el('input', { name: 'weekly_hours', type: 'number', min: 0, step: 0.5, value: x.weekly_hours || '' }))),
     field('Notes', el('textarea', { name: 'notes', rows: 2 }, x.notes || '')),
-  ];
-  showDialog(p ? `Edit ${x.display_name}` : 'New project', kids, async (v, form) => {
+  ], async (v, form) => {
     const members = [...form.querySelectorAll('input[name="m"]:checked')].map((i) => i.value).join(', ');
     delete v.m;
     await post('project', { ...(p ? { project_id: x.project_id } : {}), ...v, members });
@@ -490,15 +627,12 @@ function openProject(p) {
 }
 
 // ---------- events ----------
+window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
 $('refresh').addEventListener('click', load);
-$('view-all').addEventListener('click', () => { state.view = state.view === 'tickets' ? 'projects' : 'tickets'; showView(); });
-$('back-projects').addEventListener('click', () => { state.view = 'projects'; showView(); });
-$('new-ticket').addEventListener('click', () => state.data && openTicket({}));
+$('new-task').addEventListener('click', () => state.data && openTask({}));
 $('new-project').addEventListener('click', () => state.data && openProject(null));
-$('show-closed').addEventListener('change', (e) => {
-  state.showClosed = e.target.checked;
-  if (state.data) renderProjects(state.data);
-});
+$('ticketing').addEventListener('change', (e) => { state.ticketing = e.target.checked; render(); });
+$('show-closed').addEventListener('change', (e) => { state.showClosed = e.target.checked; render(); });
 $('gate-form').addEventListener('submit', (e) => {
   e.preventDefault();
   saveKey($('gate-key').value.trim());

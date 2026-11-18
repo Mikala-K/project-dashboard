@@ -18,33 +18,28 @@
 <body>
   <header class="top">
     <div class="top-inner">
-      <h1>Project Dashboard</h1>
+      <h1><a href="#" class="home-link">Project Dashboard</a></h1>
       <p class="hello" id="hello"></p>
       <div class="top-actions">
-        <button class="top-btn solid" id="new-ticket" type="button">New ticket</button>
+        <button class="top-btn solid" id="new-task" type="button">New task</button>
         <button class="top-btn" id="new-project" type="button">New project</button>
         <button class="top-btn" id="refresh" type="button">Refresh</button>
       </div>
     </div>
+    <nav class="tabs" aria-label="Views">
+      <a href="#" data-view="home">Dashboard</a>
+      <a href="#tasks" data-view="tasks">All tasks</a>
+      <a href="#log" data-view="log">Log</a>
+    </nav>
   </header>
 
   <main id="app" class="layout">
-    <section class="next" aria-labelledby="next-title">
+    <section class="next" id="next-section" aria-labelledby="next-title">
       <h2 id="next-title">Up next for you</h2>
       <ol class="next-list" id="next-list"></ol>
-      <button class="link view-all" id="view-all" type="button">View all tickets</button>
     </section>
 
-    <section class="all-tickets" id="all-tickets" aria-labelledby="all-title" hidden>
-      <div class="projects-head">
-        <h2 id="all-title">All tickets</h2>
-        <button class="link" id="back-projects" type="button">Back to projects</button>
-      </div>
-      <div class="filters" id="ticket-filters"></div>
-      <div class="table-wrap" id="ticket-table"></div>
-    </section>
-
-    <section class="projects" id="projects" aria-labelledby="projects-title">
+    <section class="view" id="view-home" aria-labelledby="projects-title">
       <div class="projects-head">
         <h2 id="projects-title">Projects</h2>
         <label class="closed-toggle"><input type="checkbox" id="show-closed"> Show done and canceled</label>
@@ -52,6 +47,23 @@
       <div class="chips" id="client-chips" role="group" aria-label="Filter by client"></div>
       <div id="project-groups"></div>
     </section>
+
+    <section class="view" id="view-tasks" aria-labelledby="tasks-title" hidden>
+      <div class="projects-head">
+        <h2 id="tasks-title">All tasks</h2>
+        <label class="switch"><input type="checkbox" id="ticketing"> Ticketing mode</label>
+      </div>
+      <div class="filters" id="task-filters"></div>
+      <div class="table-wrap" id="task-table"></div>
+    </section>
+
+    <section class="view" id="view-log" aria-labelledby="log-title" hidden>
+      <div class="projects-head"><h2 id="log-title">Log</h2></div>
+      <div class="filters" id="log-filters"></div>
+      <div id="log-list"></div>
+    </section>
+
+    <section class="view" id="view-project" aria-live="polite" hidden></section>
   </main>
 
   <div class="gate" id="gate" hidden>
