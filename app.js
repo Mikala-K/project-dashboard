@@ -74,6 +74,12 @@ const isSecondary = (p) => clientOf(p).relationship === 'Internal';
 const openIds = () => new Set(state.data.tickets.map((t) => t.ticket_id));
 const subtasksOf = (t) => state.data.tickets.filter((k) => k.parent_ticket === t.ticket_id);
 const isTopLevel = (t, ids = openIds()) => !t.parent_ticket || !ids.has(t.parent_ticket);
+const parseLinks = (text) => String(text || '').split('\n').map((line) => {
+  const i = line.indexOf('|');
+  const name = (i < 0 ? '' : line.slice(0, i)).trim();
+  const url = (i < 0 ? line : line.slice(i + 1)).trim();
+  return { name: name || url, url };
+}).filter((l) => /^https?:\/\//.test(l.url));
 const tasksOfProject = (id) => state.data.tickets.filter((t) => t.project === id);
 const hoursLogged = (id) => Math.round(state.data.log.filter((l) => l.project === id).reduce((s, l) => s + (Number(l.actual_hours) || 0), 0) * 100) / 100;
 function hoursText(p) {
@@ -109,7 +115,7 @@ function upNext() {
 }
 
 // ---------- load ----------
-async function load() {
+async function load(retried = false) {
   const key = currentKey();
   if (!key) { showGate(); return; }
   status('Loading…');
@@ -124,8 +130,9 @@ async function load() {
     render();
     status('');
   } catch (err) {
-    status('Could not load the dashboard. Check your connection and press Refresh.');
     console.error(err);
+    if (!retried) { status('Busy for a moment, trying again…'); setTimeout(() => load(true), 8000); return; }
+    status('Could not load the dashboard. Wait a minute, then press Refresh.');
   }
 }
 function showGate(msg) {
@@ -387,6 +394,11 @@ function renderProjectPage(id) {
           fact('Owner', p.owner), fact('Team', p.members), fact('Timeframe', dates), fact('Hours', hours),
           fact('Categories', p.categories), fact('Tools', p.tools)),
         el('button', { type: 'button', class: 'link', onclick: () => openProject(p) }, 'Edit project')),
+      el('div', { class: 'panel' },
+        el('h3', {}, 'Links'),
+        parseLinks(p.links).length
+          ? el('ul', { class: 'links' }, parseLinks(p.links).map((l) => el('li', {}, el('a', { href: l.url, target: '_blank', rel: 'noopener' }, l.name))))
+          : el('p', { class: 'meter-empty' }, 'No links yet. Add the project folder and docs with Edit project.')),
     ),
     el('div', { class: 'panel' },
       el('div', { class: 'projects-head' },
@@ -607,15 +619,51 @@ function openTask({ task, project }) {
   });
 }
 
+
+// Time picker: 5 and 10 minutes for quick tasks, then 15-minute steps. Saves hours to 2 decimals.
+function timeStepper(name, hours) {
+  let mins = hours ? Math.round(Number(hours) * 60) : 15;
+  const hidden = el('input', { type: 'hidden', name });
+  const label = el('output', { class: 'stepper-value', 'aria-live': 'polite' });
+  const show = () => {
+    const h = Math.floor(mins / 60); const m = mins % 60;
+    label.textContent = [h ? `${h} h` : '', m || !h ? `${m} min` : ''].filter(Boolean).join(' ');
+    hidden.value = String(Math.round((mins / 60) * 100) / 100);
+  };
+  const down = () => { mins = mins <= 15 ? Math.max(5, mins - 5) : Math.ceil(mins / 15) * 15 - 15; show(); };
+  const up = () => { mins = mins < 15 ? mins + 5 : Math.floor(mins / 15) * 15 + 15; show(); };
+  show();
+  return el('div', { class: 'stepper' },
+    el('button', { type: 'button', class: 'step-btn', 'aria-label': 'Less time', onclick: down }, '−'),
+    label,
+    el('button', { type: 'button', class: 'step-btn', 'aria-label': 'More time', onclick: up }, '+'),
+    hidden);
+}
+
 function openComplete(t) {
   showDialog('Check off task', [
     el('p', { class: 'form-sub' }, `${t.ticket_id} ${t.task}`),
     field('Summary or findings', el('textarea', { name: 'what_was_done', rows: 4, required: true })),
-    field('Time spent on task', el('input', { name: 'actual_hours', type: 'number', min: 0, step: 0.25, value: t.actual_hours || '' }), 'In hours, like 0.5 for 30 minutes'),
+    el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Estimated time spent on task'), timeStepper('actual_hours', t.actual_hours)),
   ], async (v) => {
     await post('ticket/update', { ticket_id: t.ticket_id, complete: v });
     status('Checked off and saved to the log');
   }, 'Check off');
+}
+
+
+// Named links: a nickname plus the URL, one row each. The first row is the project folder.
+function linkEditor(text) {
+  const existing = parseLinks(text);
+  const list = el('div', { class: 'link-rows' });
+  const addRow = (l = {}, placeholder = 'Link name') => list.append(el('div', { class: 'row link-row' },
+    el('input', { 'data-k': 'name', name: 'link_name', placeholder, value: l.name && l.name !== l.url ? l.name : '', 'aria-label': 'Link name' }),
+    el('input', { 'data-k': 'url', name: 'link_url', type: 'url', placeholder: 'https://', value: l.url || '', 'aria-label': 'Link URL' })));
+  if (existing.length) existing.forEach((l) => addRow(l)); else addRow({}, 'Project folder');
+  return el('fieldset', { class: 'field' }, el('legend', { class: 'field-label' }, 'Links'),
+    el('span', { class: 'field-hint' }, 'Give each link a short name, like L\'GATO project folder or Master documentation'),
+    list,
+    el('button', { type: 'button', class: 'link', onclick: () => addRow() }, 'Add another link'));
 }
 
 function openProject(p) {
@@ -640,7 +688,15 @@ function openProject(p) {
       field('Allocated hours', el('input', { name: 'allocated_hours', type: 'number', min: 0, step: 0.5, value: x.allocated_hours || '' })),
       field('Weekly hours', el('input', { name: 'weekly_hours', type: 'number', min: 0, step: 0.5, value: x.weekly_hours || '' }))),
     field('Notes', el('textarea', { name: 'notes', rows: 2 }, x.notes || '')),
+    linkEditor(x.links),
   ], async (v, form) => {
+    const links = [...form.querySelectorAll('.link-row')].map((r) => {
+      const name = r.querySelector('[data-k="name"]').value.trim().replace(/\|/g, '-');
+      const url = r.querySelector('[data-k="url"]').value.trim();
+      return url ? `${name || url} | ${url}` : '';
+    }).filter(Boolean).join('\n');
+    v.links = links;
+    delete v.link_name; delete v.link_url;
     const members = [...form.querySelectorAll('input[name="m"]:checked')].map((i) => i.value).join(', ');
     delete v.m;
     await post('project', { ...(p ? { project_id: x.project_id } : {}), ...v, members });
@@ -650,7 +706,7 @@ function openProject(p) {
 
 // ---------- events ----------
 window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
-$('refresh').addEventListener('click', load);
+$('refresh').addEventListener('click', () => load());
 $('new-task').addEventListener('click', () => state.data && openTask({}));
 $('new-project').addEventListener('click', () => state.data && openProject(null));
 $('ticketing').addEventListener('change', (e) => { state.ticketing = e.target.checked; render(); });
