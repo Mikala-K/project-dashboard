@@ -75,6 +75,13 @@ const openIds = () => new Set(state.data.tickets.map((t) => t.ticket_id));
 const subtasksOf = (t) => state.data.tickets.filter((k) => k.parent_ticket === t.ticket_id);
 const isTopLevel = (t, ids = openIds()) => !t.parent_ticket || !ids.has(t.parent_ticket);
 const tasksOfProject = (id) => state.data.tickets.filter((t) => t.project === id);
+const hoursLogged = (id) => Math.round(state.data.log.filter((l) => l.project === id).reduce((s, l) => s + (Number(l.actual_hours) || 0), 0) * 100) / 100;
+function hoursText(p) {
+  const used = hoursLogged(p.project_id);
+  const alloc = Number(p.allocated_hours) || 0;
+  if (alloc) return `${used} of ${alloc} hours used`;
+  return used ? `${used} hours logged` : '';
+}
 
 // Primary client projects that are live come first, then live WIPP projects, then everything on hold or not started
 function projectGroup(p) {
@@ -233,16 +240,33 @@ function taskCounts(projectId) {
   return sub ? `${plural(sub, 'open subtask')} from ${plural(top, 'open task')}` : plural(top, 'open task');
 }
 
+// The status bubble doubles as a dropdown so status can change right from the card
+function statusPicker(p) {
+  if (String(p.project_id).startsWith('preview')) return el('span', { class: 'project-status', 'data-status': p.status }, p.status);
+  return el('select', {
+    class: 'project-status status-select', 'data-status': p.status, 'aria-label': `Status for ${p.display_name}`,
+    onchange: async (e) => {
+      try {
+        status('Saving…');
+        await post('project', { project_id: p.project_id, status: e.target.value });
+        await load();
+        status('Status saved');
+        setTimeout(() => status(''), 1500);
+      } catch (ex) { status(`Could not save: ${ex.message}`); e.target.value = p.status; }
+    },
+  }, PROJECT_STATUSES.map((s) => el('option', { value: s, selected: s === p.status }, s)));
+}
+
 function projectCard(p) {
   const open = state.openCards.has(p.project_id);
   const tasks = tasksOfProject(p.project_id);
   const ids = new Set(tasks.map((t) => t.ticket_id));
   const top = tasks.filter((t) => isTopLevel(t, ids)).sort(byStatusThenId);
-  const facts = [taskCounts(p.project_id), p.members ? `Team: ${p.members}` : ''].filter(Boolean);
+  const facts = [taskCounts(p.project_id), hoursText(p), p.members ? `Team: ${p.members}` : ''].filter(Boolean);
   const isPreview = String(p.project_id).startsWith('preview');
   return el('article', { class: `project${CLOSED.includes(p.status) ? ' closed' : ''}` },
     el('h3', {}, isPreview ? p.display_name : el('a', { href: `#project/${encodeURIComponent(p.project_id)}`, class: 'project-link' }, p.display_name)),
-    el('span', { class: 'project-status', 'data-status': p.status }, p.status),
+    statusPicker(p),
     el('div', { class: 'project-body' },
       p.notes ? el('p', { class: 'project-note' }, p.notes) : null,
       p.status === 'Maintenance' ? maintenanceRow(p) : meter(p),
@@ -342,13 +366,13 @@ function renderProjectPage(id) {
   const log = d.log.filter((l) => l.project === id);
   const fact = (label, value) => (value ? [el('dt', {}, label), el('dd', {}, value)] : []);
   const dates = [p.start_date, p.end_date].filter(Boolean).join(' to ');
-  const hours = [p.allocated_hours ? `${p.allocated_hours} allocated` : '', p.weekly_hours ? `${p.weekly_hours} per week` : ''].filter(Boolean).join(', ');
+  const hours = [hoursText(p) || '0 hours logged', p.weekly_hours ? `${p.weekly_hours} per week` : ''].filter(Boolean).join(', ');
 
   view.replaceChildren(
     el('a', { href: '#', class: 'link back' }, 'Back to the dashboard'),
     el('div', { class: 'page-head' },
       el('h2', {}, p.display_name),
-      el('span', { class: 'project-status', 'data-status': p.status }, p.status)),
+      statusPicker(p)),
     p.notes ? el('p', { class: 'page-note' }, p.notes) : null,
     el('div', { class: 'page-grid' },
       el('div', { class: 'panel' },
@@ -586,10 +610,8 @@ function openTask({ task, project }) {
 function openComplete(t) {
   showDialog('Check off task', [
     el('p', { class: 'form-sub' }, `${t.ticket_id} ${t.task}`),
-    field('What was done', el('textarea', { name: 'what_was_done', rows: 3, required: true })),
-    field('What changed or was found', el('textarea', { name: 'what_changed', rows: 2 })),
-    field('What to add next', el('textarea', { name: 'next_steps', rows: 2 }), 'A note for the log. It does not create a new task'),
-    field('Hours spent', el('input', { name: 'actual_hours', type: 'number', min: 0, step: 0.25, value: t.actual_hours || '' })),
+    field('Summary or findings', el('textarea', { name: 'what_was_done', rows: 4, required: true })),
+    field('Time spent on task', el('input', { name: 'actual_hours', type: 'number', min: 0, step: 0.25, value: t.actual_hours || '' }), 'In hours, like 0.5 for 30 minutes'),
   ], async (v) => {
     await post('ticket/update', { ticket_id: t.ticket_id, complete: v });
     status('Checked off and saved to the log');
