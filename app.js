@@ -4,6 +4,7 @@ const API = 'https://n8n.wippdata.com/webhook/wipp-dashboard';
 const CLOSED = ['Done', 'Canceled'];
 const LIVE = ['Active', 'Maintenance', 'Ramping up'];
 const STATUS_ORDER = ['Active', 'Maintenance', 'Ramping up', 'On hold', 'Prospect', 'Done', 'Canceled'];
+const TIME_TYPES = ['Billable', 'Internal', 'Upside', 'Personal'];
 const PROJECT_STATUSES = ['Prospect', 'Ramping up', 'Active', 'On hold', 'Maintenance', 'Done', 'Canceled'];
 const TASK_STATUSES = ['Open', 'In progress', 'Blocked', 'Backlog'];
 const PRIORITY_RANK = { High: 0, Medium: 1, Low: 2 };
@@ -327,10 +328,10 @@ function maintenanceLoad(p) {
   return Math.min(1, (p.open_tickets || 0) / 10);
 }
 const STAGES = [
-  [0.5, 'heavy', 'Big features plus upkeep', 'New features are still being built while one-off fixes come in.'],
-  [0.25, 'steady', 'Steady upkeep', 'The big pieces are done. Regular fixes and tweaks each week.'],
-  [0.1, 'light', 'Light upkeep', 'A few small changes. Quick check-ins keep it healthy.'],
-  [0, 'cruise', 'Cruising', 'Check in weekly to monthly. Earning with very little upkeep.'],
+  [0.5, 'heavy', 'Needs daily attention', 'Lots of open work. Plan time for it most days.'],
+  [0.25, 'steady', 'A few check-ins per week', 'Several open tasks. Touch it a few times a week.'],
+  [0.1, 'light', 'Weekly check-in', 'A handful of tasks. One check-in a week covers it.'],
+  [0, 'cruise', 'Low upkeep', 'Little to no open work. Check in as needed.'],
 ];
 const stageFor = (load) => STAGES.find(([min]) => load >= min);
 function gauge(load) {
@@ -342,11 +343,13 @@ function maintenanceRow(p) {
   const load = maintenanceLoad(p);
   const [, , label, detail] = stageFor(load);
   const last = p.segments && p.segments.length ? p.segments[p.segments.length - 1].milestone : '';
-  const phase = last ? last.split(' - ')[0] : 'Build';
+  // No milestones means an ongoing catch-all project (like WIPP General), not a finished build
+  const ongoing = !last;
+  const phase = last ? last.split(' - ')[0] : '';
   return el('div', { class: 'maint' },
     el('div', { class: 'maint-done' },
-      el('div', { class: 'maint-arrow' }, el('span', {}, 'Complete')),
-      el('p', { class: 'maint-caption' }, `${phase} complete, in maintenance mode`)),
+      el('div', { class: 'maint-arrow' }, el('span', {}, ongoing ? 'Ongoing' : 'Complete')),
+      el('p', { class: 'maint-caption' }, ongoing ? 'Ongoing, no milestones' : `${phase} complete, in maintenance mode`)),
     el('div', { class: 'maint-gauge' }, gauge(load), el('div', { class: 'gauge-text' }, el('strong', {}, label), detail)),
   );
 }
@@ -391,6 +394,7 @@ function renderProjectPage(id) {
         el('h3', {}, 'Details'),
         el('dl', { class: 'facts' },
           fact('Client', [c.company_name || p.client, c.primary_contacts ? ` (${c.primary_contacts})` : ''].join('')),
+          fact('Time type', p.time_type ? `${p.time_type} (default for its tasks)` : ''),
           fact('Owner', p.owner), fact('Team', p.members), fact('Timeframe', dates), fact('Hours', hours),
           fact('Categories', p.categories), fact('Tools', p.tools)),
         el('button', { type: 'button', class: 'link', onclick: () => openProject(p) }, 'Edit project')),
@@ -583,6 +587,7 @@ function openTask({ task, project }) {
   const msOpts = (id) => [['', 'None'], ...d.milestones.filter((m) => m.project_id === id).map((m) => [m.milestone_id, m.milestone])];
   const parentOpts = (id) => [['', 'None (main task)'], ...d.tickets.filter((x) => x.project === id && x.ticket_id !== t.ticket_id && !x.parent_ticket).map((x) => [x.ticket_id, `${x.ticket_id} ${x.task}`])];
   const cats = el('datalist', { id: 'cat-list' }, split(p.categories).map((c) => el('option', { value: c })));
+  const typeOpts = (id) => [['', `Project default (${(projectOf(id) || {}).time_type || 'Billable'})`], ...TIME_TYPES.map((x) => [x, x])];
 
   const form = showDialog(task ? `Edit ${t.ticket_id}` : 'New task', [
     field('Task', el('input', { name: 'task', required: true, value: t.task || '' })),
@@ -600,7 +605,9 @@ function openTask({ task, project }) {
     el('div', { class: 'row' },
       field('Milestone', select('milestone_id', msOpts(projId), t.milestone_id)),
       field('Subtask of', select('parent_ticket', parentOpts(projId), t.parent_ticket))),
-    field('Blocked by', el('input', { name: 'blocked_by', value: t.blocked_by || '' }), 'Task IDs, like T-004'),
+    el('div', { class: 'row' },
+      field('Time type', select('time_type', typeOpts(projId), t.time_type || ''), 'Switch to Internal for setup, admin or anything not billed'),
+      field('Blocked by', el('input', { name: 'blocked_by', value: t.blocked_by || '' }), 'Task IDs, like T-004')),
     field('Notes', el('textarea', { name: 'notes', rows: 2 }, t.notes || '')),
     cats,
   ], async (v) => {
@@ -615,6 +622,7 @@ function openTask({ task, project }) {
     const fill = (s, opts) => s.replaceChildren(...opts.map(([v, l]) => el('option', { value: v }, l)));
     fill(form.elements.milestone_id, msOpts(id));
     fill(form.elements.parent_ticket, parentOpts(id));
+    fill(form.elements.time_type, typeOpts(id));
     $('cat-list').replaceChildren(...split((projectOf(id) || {}).categories).map((c) => el('option', { value: c })));
   });
 }
@@ -677,6 +685,8 @@ function openProject(p) {
     el('div', { class: 'row' },
       field('Status', select('status', PROJECT_STATUSES.map((s) => [s, s]), x.status || 'Active')),
       field('Owner', select('owner', d.people.map((n) => [n, n]), x.owner || d.user.name))),
+    field('Time type', select('time_type', TIME_TYPES.map((t) => [t, t]), x.time_type || 'Billable'),
+      'Default for this project\'s tasks. Any task can switch to another type'),
     el('fieldset', { class: 'field members' }, el('legend', { class: 'field-label' }, 'Members'),
       d.people.map((n) => el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'm', value: n, checked: p ? memberSet.has(n) : n === d.user.name }), n))),
     field('Tools', el('input', { name: 'tools', value: x.tools || '' }), 'Comma separated, like n8n, G Sheets, Claude TBD'),
