@@ -97,16 +97,35 @@ function projectGroup(p) {
   return isSecondary(p) ? 1 : 0;
 }
 
+// Chain-linked next steps: a task with open subtasks is never shown itself. Its first open subtask
+// (by task number, Backlog last) stands in for it, all the way down. That step inherits the parent's
+// priority when the parent's is higher, so a High parent always surfaces its next step as High.
+const sortSubs = (list) => [...list].sort(byStatusThenId);
+function nextStep(t) {
+  const kids = sortSubs(subtasksOf(t)).filter((k) => k.status !== 'Backlog');
+  return kids.length ? nextStep(kids[0]) : t;
+}
+const topRank = (a, b) => Math.min(PRIORITY_RANK[a] ?? 2, PRIORITY_RANK[b] ?? 2);
+const RANK_NAME = ['High', 'Medium', 'Low'];
 function upNext() {
   const d = state.data;
   const ids = openIds();
   const me = d.user.name;
+  const seen = new Set();
   return d.tickets
-    .filter((t) => t.status !== 'Backlog' && split(t.assignee).includes(me))
-    .filter((t) => isTopLevel(t, ids) || t.priority === 'High')
+    .filter((t) => isTopLevel(t, ids) && t.status !== 'Backlog')
+    .map((root) => {
+      const step = nextStep(root);
+      const mine = split(step.assignee).includes(me) || (!step.assignee && step !== root && split(root.assignee).includes(me));
+      if (!mine || seen.has(step.ticket_id)) return null;
+      seen.add(step.ticket_id);
+      const parent = step === root ? null : d.tickets.find((x) => x.ticket_id === step.parent_ticket);
+      return { ...step, _priority: RANK_NAME[topRank(step.priority, root.priority)], _parent: parent };
+    })
+    .filter(Boolean)
     .sort((a, b) => {
       const pa = projectOf(a.project); const pb = projectOf(b.project);
-      return (PRIORITY_RANK[a.priority] ?? 3) - (PRIORITY_RANK[b.priority] ?? 3)
+      return (PRIORITY_RANK[a._priority] ?? 3) - (PRIORITY_RANK[b._priority] ?? 3)
         || projectGroup(pa) - projectGroup(pb)
         || tasksOfProject(b.project).length - tasksOfProject(a.project).length
         || (toIso(a.due_date) || '9999').localeCompare(toIso(b.due_date) || '9999')
@@ -173,20 +192,22 @@ function taskRow(t, opts = {}) {
   const expanded = opts.expandAll || state.openTasks.has(t.ticket_id);
   const meta = [
     opts.showProject ? projectName(t.project) : null,
-    `${t.priority || 'Low'} priority`,
+    `${t._priority || t.priority || 'Low'} priority`,
     t.due_date ? `Due ${t.due_date}` : null,
     t.status !== 'Open' ? t.status : null,
     t.category || null,
     opts.showAssignee ? (t.assignee || 'Unassigned') : null,
     t.blocked_by ? `Waiting on ${t.blocked_by}` : null,
-    opts.markSub && t.parent_ticket ? `Subtask of ${t.parent_ticket}` : null,
   ].filter(Boolean);
+  const parent = opts.markSub && t.parent_ticket ? (t._parent || state.data.tickets.find((x) => x.ticket_id === t.parent_ticket)) : null;
   const li = el('li', { class: 'task', 'data-priority': t.priority },
     el('input', { type: 'checkbox', class: 'tick', 'aria-label': `Check off ${t.task}`, onchange: (e) => { e.target.checked = false; openComplete(t); } }),
     el('div', {},
       el('button', { type: 'button', class: 'task-open', onclick: () => openTask({ task: t }) },
         el('span', { class: 'task-id' }, t.ticket_id), ' ', el('span', { class: 'task-name' }, t.task)),
       el('span', { class: 'task-meta' }, meta.map((m) => el('span', {}, m))),
+      parent ? el('span', { class: 'task-parent' }, 'Subtask of ',
+        el('button', { type: 'button', class: 'link', onclick: () => openTask({ task: parent }) }, `${parent.ticket_id} ${parent.task}`)) : null,
       kids.length && !opts.expandAll ? el('button', {
         type: 'button', class: 'link sub-toggle', 'aria-expanded': String(expanded),
         onclick: () => { if (expanded) state.openTasks.delete(t.ticket_id); else state.openTasks.add(t.ticket_id); render(); },
@@ -329,7 +350,7 @@ function maintenanceLoad(p) {
 }
 const STAGES = [
   [0.5, 'heavy', 'Needs daily attention', 'Lots of open work. Plan time for it most days.'],
-  [0.25, 'steady', 'A few check-ins per week', 'Several open tasks. Touch it a few times a week.'],
+  [0.25, 'steady', 'A few check-ins per week', 'Several open tasks. Check in a few times a week.'],
   [0.1, 'light', 'Weekly check-in', 'A handful of tasks. One check-in a week covers it.'],
   [0, 'cruise', 'Low upkeep', 'Little to no open work. Check in as needed.'],
 ];
@@ -526,9 +547,10 @@ function renderTasks() {
 function logList(entries, showProject) {
   return el('ol', { class: 'log-list' }, entries.map((l) => el('li', { class: 'log-item' },
     el('div', { class: 'log-head' },
-      el('strong', {}, `${l.ticket_id} ${l.task}`),
+      el('strong', {}, [l.ticket_id, l.task].filter(Boolean).join(' ')),
       el('span', {}, [l.completed_at, l.completed_by, l.actual_hours ? `${l.actual_hours} h` : ''].filter(Boolean).join(', '))),
     showProject ? el('p', { class: 'log-project' }, projectName(l.project)) : null,
+    l.completed_by === state.data.user.name ? el('button', { type: 'button', class: 'link log-edit', onclick: () => openLogEdit(l) }, 'Edit') : null,
     el('dl', { class: 'log-notes' },
       l.what_was_done ? [el('dt', {}, 'Done'), el('dd', {}, l.what_was_done)] : null,
       l.what_changed ? [el('dt', {}, 'Changed or found'), el('dd', {}, l.what_changed)] : null,
@@ -551,7 +573,7 @@ function field(label, input, hint) {
 function select(name, options, value) {
   return el('select', { name }, options.map(([v, l]) => el('option', { value: v, selected: String(v) === String(value ?? '') }, l)));
 }
-function showDialog(title, formKids, onSave, saveLabel) {
+function showDialog(title, formKids, onSave, saveLabel, after) {
   const dlg = $('dialog');
   const err = el('p', { class: 'form-error', role: 'alert' });
   const form = el('form', { method: 'dialog', class: 'form' },
@@ -568,6 +590,7 @@ function showDialog(title, formKids, onSave, saveLabel) {
       await onSave(values, form);
       dlg.close();
       await load();
+      if (after) after();
     } catch (ex) { err.textContent = ex.message; } finally { btn.disabled = false; }
   });
   dlg.replaceChildren(form);
@@ -628,9 +651,9 @@ function openTask({ task, project }) {
 }
 
 
-// Time picker: 5 and 10 minutes for quick tasks, then 15-minute steps. Saves hours to 2 decimals.
+// Time picker: 0, 5 and 10 minutes for quick tasks, then 15-minute steps. Saves hours to 2 decimals.
 function timeStepper(name, hours) {
-  let mins = hours ? Math.round(Number(hours) * 60) : 15;
+  let mins = hours !== undefined && hours !== '' && hours !== null ? Math.round(Number(hours) * 60) : 15;
   const hidden = el('input', { type: 'hidden', name });
   const label = el('output', { class: 'stepper-value', 'aria-live': 'polite' });
   const show = () => {
@@ -638,7 +661,7 @@ function timeStepper(name, hours) {
     label.textContent = [h ? `${h} h` : '', m || !h ? `${m} min` : ''].filter(Boolean).join(' ');
     hidden.value = String(Math.round((mins / 60) * 100) / 100);
   };
-  const down = () => { mins = mins <= 15 ? Math.max(5, mins - 5) : Math.ceil(mins / 15) * 15 - 15; show(); };
+  const down = () => { mins = mins <= 15 ? Math.max(0, mins - 5) : Math.ceil(mins / 15) * 15 - 15; show(); };
   const up = () => { mins = mins < 15 ? mins + 5 : Math.floor(mins / 15) * 15 + 15; show(); };
   show();
   return el('div', { class: 'stepper' },
@@ -648,17 +671,51 @@ function timeStepper(name, hours) {
     hidden);
 }
 
+const openDescendants = (t) => subtasksOf(t).flatMap((k) => [...openDescendants(k), k]);
 function openComplete(t) {
+  const kids = openDescendants(t);
+  const parent = t.parent_ticket ? state.data.tickets.find((x) => x.ticket_id === t.parent_ticket) : null;
+  const lastSub = parent && subtasksOf(parent).every((k) => k.ticket_id === t.ticket_id);
   showDialog('Check off task', [
     el('p', { class: 'form-sub' }, `${t.ticket_id} ${t.task}`),
+    kids.length ? el('p', { class: 'form-warn' }, `This also checks off its ${plural(kids.length, 'open subtask')} (${kids.map((k) => k.ticket_id).join(', ')}) with the note "Done with ${t.ticket_id}" and 0 min.`) : null,
     field('Summary or findings', el('textarea', { name: 'what_was_done', rows: 4, required: true })),
     el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Estimated time spent on task'), timeStepper('actual_hours', t.actual_hours)),
   ], async (v) => {
+    for (const k of kids) await post('ticket/update', { ticket_id: k.ticket_id, complete: { what_was_done: `Done with ${t.ticket_id}`, actual_hours: 0 } });
     await post('ticket/update', { ticket_id: t.ticket_id, complete: v });
     status('Checked off and saved to the log');
-  }, 'Check off');
+  }, 'Check off', lastSub ? () => openParentPrompt(parent.ticket_id) : null);
 }
 
+// After the last subtask is checked off, offer to check off its parent
+function openParentPrompt(id) {
+  const parent = state.data.tickets.find((x) => x.ticket_id === id);
+  if (!parent) return;
+  const dlg = $('dialog');
+  dlg.replaceChildren(el('div', { class: 'form' },
+    el('h2', {}, 'All subtasks complete'),
+    el('p', {}, `Every subtask of ${parent.ticket_id} ${parent.task} is done. Mark it complete too?`),
+    el('div', { class: 'form-actions' },
+      el('button', { type: 'button', class: 'secondary', onclick: () => dlg.close() }, 'Not yet'),
+      el('button', { type: 'button', class: 'primary', onclick: () => { dlg.close(); openComplete(parent); } }, 'Check off parent'))));
+  dlg.showModal();
+}
+
+// Edit a checked-off Log entry: summary, time spent and time type
+function openLogEdit(l) {
+  const p = projectOf(l.project) || {};
+  showDialog('Edit log entry', [
+    el('p', { class: 'form-sub' }, [l.ticket_id, l.task].filter(Boolean).join(' ')),
+    field('Summary or findings', el('textarea', { name: 'what_was_done', rows: 4 }, l.what_was_done || '')),
+    el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Time spent'), timeStepper('actual_hours', l.actual_hours === '' ? 0 : l.actual_hours)),
+    field('Time type', select('time_type', [['', `Project default (${p.time_type || 'Billable'})`], ...TIME_TYPES.map((x) => [x, x])], l.time_type || '')),
+  ], async (v) => {
+    await post('session', { action: 'log_edit', log_id: l.log_id, ...v });
+    if (l.ticket_id) await post('ticket/update', { ticket_id: l.ticket_id, actual_hours: v.actual_hours }).catch(() => {});
+    status('Log entry saved');
+  }, 'Save entry');
+}
 
 // Named links: a nickname plus the URL, one row each. The first row is the project folder.
 function linkEditor(text) {

@@ -79,6 +79,8 @@ button { cursor: pointer; }
 .task-name { font-weight: 700; display: block; }
 .task-open:hover .task-name { text-decoration: underline; }
 .task-meta { font-size: 14px; color: var(--ink-soft); display: flex; gap: 4px 12px; flex-wrap: wrap; margin-top: 2px; }
+.task-parent { display: block; font-size: 13px; color: var(--ink-soft); margin-top: 2px; }
+.task-parent .link { font-size: 13px; }
 .task-list { margin-top: 12px; }
 .project .task { background: var(--paper); }
 .task-list.sub { grid-column: 2; margin-top: 8px; }
@@ -186,6 +188,8 @@ button { cursor: pointer; }
 .form { padding: 22px 24px; display: grid; gap: 12px; }
 .form h2 { font-size: 22px; }
 .form-sub { margin: -6px 0 0; color: var(--ink-soft); }
+.form-warn { margin: 0; padding: 8px 10px; border-radius: 8px; background: #f3effb; color: var(--ink); font-size: 14px; }
+.log-edit { align-self: flex-start; font-size: 13px; }
 .row { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 .field { display: grid; gap: 4px; border: 0; padding: 0; margin: 0; min-width: 0; }
 .field-label { font-size: 14px; font-weight: 700; }
