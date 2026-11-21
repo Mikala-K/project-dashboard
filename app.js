@@ -120,15 +120,16 @@ function upNext() {
       if (!mine || seen.has(step.ticket_id)) return null;
       seen.add(step.ticket_id);
       const parent = step === root ? null : d.tickets.find((x) => x.ticket_id === step.parent_ticket);
-      return { ...step, _priority: RANK_NAME[topRank(step.priority, root.priority)], _parent: parent };
+      const eff = RANK_NAME[topRank(step.priority, root.priority)];
+      return { ...step, _priority: eff, _from: eff !== (step.priority || 'Low') ? root.ticket_id : '', _parent: parent };
     })
     .filter(Boolean)
     .sort((a, b) => {
       const pa = projectOf(a.project); const pb = projectOf(b.project);
       return (PRIORITY_RANK[a._priority] ?? 3) - (PRIORITY_RANK[b._priority] ?? 3)
+        || (toIso(a.due_date) || '9999').localeCompare(toIso(b.due_date) || '9999')
         || projectGroup(pa) - projectGroup(pb)
         || tasksOfProject(b.project).length - tasksOfProject(a.project).length
-        || (toIso(a.due_date) || '9999').localeCompare(toIso(b.due_date) || '9999')
         || idNum(a.ticket_id) - idNum(b.ticket_id);
     })
     .slice(0, UP_NEXT_COUNT);
@@ -192,7 +193,7 @@ function taskRow(t, opts = {}) {
   const expanded = opts.expandAll || state.openTasks.has(t.ticket_id);
   const meta = [
     opts.showProject ? projectName(t.project) : null,
-    `${t._priority || t.priority || 'Low'} priority`,
+    `${t._priority || t.priority || 'Low'} priority${t._from ? `, from ${t._from}` : ''}`,
     t.due_date ? `Due ${t.due_date}` : null,
     t.status !== 'Open' ? t.status : null,
     t.category || null,
@@ -200,7 +201,7 @@ function taskRow(t, opts = {}) {
     t.blocked_by ? `Waiting on ${t.blocked_by}` : null,
   ].filter(Boolean);
   const parent = opts.markSub && t.parent_ticket ? (t._parent || state.data.tickets.find((x) => x.ticket_id === t.parent_ticket)) : null;
-  const li = el('li', { class: 'task', 'data-priority': t.priority },
+  const li = el('li', { class: 'task', 'data-priority': t._priority || t.priority || 'Low' },
     el('input', { type: 'checkbox', class: 'tick', 'aria-label': `Check off ${t.task}`, onchange: (e) => { e.target.checked = false; openComplete(t); } }),
     el('div', {},
       el('button', { type: 'button', class: 'task-open', onclick: () => openTask({ task: t }) },
@@ -415,7 +416,7 @@ function renderProjectPage(id) {
         el('h3', {}, 'Details'),
         el('dl', { class: 'facts' },
           fact('Client', [c.company_name || p.client, c.primary_contacts ? ` (${c.primary_contacts})` : ''].join('')),
-          fact('Time type', p.time_type ? `${p.time_type} (default for its tasks)` : ''),
+          fact('Time type', p.time_type || ''),
           fact('Owner', p.owner), fact('Team', p.members), fact('Timeframe', dates), fact('Hours', hours),
           fact('Categories', p.categories), fact('Tools', p.tools)),
         el('button', { type: 'button', class: 'link', onclick: () => openProject(p) }, 'Edit project')),
@@ -600,7 +601,9 @@ function showDialog(title, formKids, onSave, saveLabel, after) {
   return form;
 }
 
-function openTask({ task, project }) {
+// Close the open dialog before opening another one (a dialog can't be opened twice)
+const swapTo = (fn) => { $('dialog').close(); fn(); };
+function openTask({ task, project, parent }) {
   const d = state.data;
   const t = task || {};
   const projId = t.project || project || '';
@@ -612,7 +615,15 @@ function openTask({ task, project }) {
   const cats = el('datalist', { id: 'cat-list' }, split(p.categories).map((c) => el('option', { value: c })));
   const typeOpts = (id) => [['', `Project default (${(projectOf(id) || {}).time_type || 'Billable'})`], ...TIME_TYPES.map((x) => [x, x])];
 
+  const kids = task ? sortSubs(subtasksOf(t)) : [];
+  const parentT = t.parent_ticket ? d.tickets.find((x) => x.ticket_id === t.parent_ticket) : null;
+  const relations = task ? el('div', { class: 'subtask-box' },
+    parentT ? el('p', { class: 'form-sub' }, 'Subtask of ', el('button', { type: 'button', class: 'link', onclick: () => swapTo(() => openTask({ task: parentT })) }, `${parentT.ticket_id} ${parentT.task}`)) : null,
+    el('strong', {}, kids.length ? `${plural(kids.length, 'open subtask')}` : 'No open subtasks'),
+    kids.length ? el('ul', {}, kids.map((k) => el('li', {}, el('button', { type: 'button', class: 'link', onclick: () => swapTo(() => openTask({ task: k })) }, `${k.ticket_id} ${k.task}`), k.status !== 'Open' ? ` (${k.status})` : ''))) : null,
+    el('button', { type: 'button', class: 'link', onclick: () => swapTo(() => openTask({ project: t.project, parent: t.ticket_id })) }, 'Add a subtask')) : null;
   const form = showDialog(task ? `Edit ${t.ticket_id}` : 'New task', [
+    relations,
     field('Task', el('input', { name: 'task', required: true, value: t.task || '' })),
     field('Description', el('textarea', { name: 'description', rows: 2 }, t.description || '')),
     el('div', { class: 'row' },
@@ -627,7 +638,7 @@ function openTask({ task, project }) {
       field('Estimated hours', el('input', { name: 'est_hours', type: 'number', min: 0, step: 0.25, value: t.est_hours || '' }))),
     el('div', { class: 'row' },
       field('Milestone', select('milestone_id', msOpts(projId), t.milestone_id)),
-      field('Subtask of', select('parent_ticket', parentOpts(projId), t.parent_ticket))),
+      field('Subtask of', select('parent_ticket', parentOpts(projId), t.parent_ticket || parent || ''))),
     el('div', { class: 'row' },
       field('Time type', select('time_type', typeOpts(projId), t.time_type || ''), 'Switch to Internal for setup, admin or anything not billed'),
       field('Blocked by', el('input', { name: 'blocked_by', value: t.blocked_by || '' }), 'Task IDs, like T-004')),
@@ -671,6 +682,13 @@ function timeStepper(name, hours) {
     hidden);
 }
 
+// Summary box that starts as "done": clicking in clears it, leaving it empty puts "done" back
+function doneBox() {
+  const box = el('textarea', { name: 'what_was_done', rows: 4, required: true }, 'done');
+  box.addEventListener('focus', () => { if (box.value.trim() === 'done') box.value = ''; });
+  box.addEventListener('blur', () => { if (!box.value.trim()) box.value = 'done'; });
+  return box;
+}
 const openDescendants = (t) => subtasksOf(t).flatMap((k) => [...openDescendants(k), k]);
 function openComplete(t) {
   const kids = openDescendants(t);
@@ -679,7 +697,7 @@ function openComplete(t) {
   showDialog('Check off task', [
     el('p', { class: 'form-sub' }, `${t.ticket_id} ${t.task}`),
     kids.length ? el('p', { class: 'form-warn' }, `This also checks off its ${plural(kids.length, 'open subtask')} (${kids.map((k) => k.ticket_id).join(', ')}) with the note "Done with ${t.ticket_id}" and 0 min.`) : null,
-    field('Summary or findings', el('textarea', { name: 'what_was_done', rows: 4, required: true })),
+    field('Summary or findings', doneBox(), 'Leave it as "done" or click in to write your own'),
     el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Estimated time spent on task'), timeStepper('actual_hours', t.actual_hours)),
   ], async (v) => {
     for (const k of kids) await post('ticket/update', { ticket_id: k.ticket_id, complete: { what_was_done: `Done with ${t.ticket_id}`, actual_hours: 0 } });
