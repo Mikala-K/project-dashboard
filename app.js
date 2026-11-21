@@ -10,6 +10,16 @@ const TASK_STATUSES = ['Open', 'In progress', 'Blocked', 'Backlog'];
 const PRIORITY_RANK = { High: 0, Medium: 1, Low: 2 };
 const TASK_STATUS_RANK = { 'In progress': 0, Open: 1, Blocked: 2, Backlog: 3 };
 const UP_NEXT_COUNT = 5;
+const REPEATS = ['Weekly', 'Every 2 weeks', 'Monthly'];
+// Until her 40-hour weeks start, 15 of the 40 hours stay frozen (about 25 working hours)
+const FULL_TIME_START = '2027-01-11';
+const DEFAULT_FROZEN = 15;
+// Nathan's 40-hour framework: paid work 25 to 30, upside software 5 to 10, personal projects 5 to 10
+const FRAMEWORK = [
+  ['Paid work', ['Billable', 'Internal'], 25, 30, 'Billable plus Internal (client work, admin, check-ins)'],
+  ['Upside', ['Upside'], 5, 10, 'Internal tools that could earn revenue, like SPRK'],
+  ['Personal', ['Personal'], 5, 10, 'Personal projects, like this dashboard'],
+];
 const KEY_STORE = 'pd_key';
 
 const $ = (id) => document.getElementById(id);
@@ -17,6 +27,9 @@ const state = {
   data: null, client: 'all', showClosed: false, ticketing: false,
   openCards: new Set(), openTasks: new Set(),
   sort: { key: 'priority', dir: 1 }, filter: { project: '', assignee: '', category: '' }, logProject: '',
+  // Desktop layout: split (both), next (Up next wide), projects (Up next tucked away)
+  layout: 'split', projLayout: 'projects', lastView: 'home', nextFolded: false,
+  week: '',
 };
 
 // ---------- key handling ----------
@@ -162,26 +175,50 @@ function showGate(msg) {
   $('gate-key').focus();
 }
 
+// ---------- layout (desktop arrows and mobile fold) ----------
+const layoutMode = (view) => (view === 'project' ? state.projLayout : state.layout);
+function setLayout(mode) {
+  if (route().view === 'project') state.projLayout = mode; else state.layout = mode;
+  applyLayout(route().view);
+}
+function applyLayout(view) {
+  const app = $('app');
+  const mode = layoutMode(view);
+  for (const m of ['split', 'next', 'projects']) app.classList.toggle(`mode-${m}`, mode === m);
+  app.classList.toggle('next-folded', state.nextFolded);
+  $('push-left').disabled = mode === 'projects';
+  $('push-right').disabled = mode === 'next';
+  $('strip-right').textContent = view === 'project' ? 'Project' : 'Projects';
+  $('next-fold').setAttribute('aria-expanded', String(!state.nextFolded));
+  $('next-fold').setAttribute('aria-label', state.nextFolded ? 'Expand Up next' : 'Collapse Up next');
+}
+// The arrows push the divider: left shrinks Up next, right widens it
+const pushLeft = () => setLayout(layoutMode(route().view) === 'next' ? 'split' : 'projects');
+const pushRight = () => setLayout(layoutMode(route().view) === 'projects' ? 'split' : 'next');
+
 // ---------- routing ----------
 function route() {
   const h = location.hash.replace(/^#/, '');
   if (h.startsWith('project/')) return { view: 'project', id: decodeURIComponent(h.slice(8)) };
-  if (h === 'tasks' || h === 'log') return { view: h };
+  if (h === 'tasks' || h === 'log' || h === 'hours') return { view: h };
   return { view: 'home' };
 }
 function render() {
   if (!state.data) return;
   const r = route();
   $('hello').textContent = `Hi ${state.data.user.name}`;
-  for (const v of ['home', 'tasks', 'log', 'project']) $(`view-${v}`).hidden = v !== r.view;
-  const wide = r.view === 'tasks' || r.view === 'log';
+  for (const v of ['home', 'tasks', 'log', 'hours', 'project']) $(`view-${v}`).hidden = v !== r.view;
+  const wide = r.view === 'tasks' || r.view === 'log' || r.view === 'hours';
   $('next-section').hidden = wide;
   $('app').classList.toggle('full', wide);
+  applyLayout(r.view);
+  renderSessionBar();
   document.querySelectorAll('.tabs a').forEach((a) => a.setAttribute('aria-current', a.dataset.view === r.view ? 'page' : 'false'));
   renderNext();
   if (r.view === 'home') { renderChips(); renderProjects(); }
   if (r.view === 'tasks') renderTasks();
   if (r.view === 'log') renderLog();
+  if (r.view === 'hours') renderHours();
   if (r.view === 'project') renderProjectPage(r.id);
 }
 
@@ -196,6 +233,7 @@ function taskRow(t, opts = {}) {
     // Up next stays lean: the color bar shows priority, the card shows project, due date and parent only
     opts.markSub ? null : `${t.priority || 'Low'} priority`,
     t.due_date ? `Due ${t.due_date}` : null,
+    !opts.markSub && REPEATS.includes(t.repeat) ? `Repeats ${t.repeat.toLowerCase()}` : null,
     t.status !== 'Open' ? t.status : null,
     opts.markSub ? null : (t.category || null),
     opts.showAssignee ? (t.assignee || 'Unassigned') : null,
@@ -551,6 +589,9 @@ function logList(entries, showProject) {
     el('div', { class: 'log-head' },
       el('strong', {}, [l.ticket_id, l.task].filter(Boolean).join(' ')),
       el('span', {}, [l.completed_at, l.completed_by, l.actual_hours ? `${l.actual_hours} h` : ''].filter(Boolean).join(', '))),
+    el('div', { class: 'type-chips' },
+      el('span', { class: 'type-chip', 'data-type': typeOf(l) }, typeOf(l)),
+      l.source === 'Calendar' || l.source === 'Extra' ? el('span', { class: 'type-chip' }, l.source === 'Calendar' ? 'From calendar' : 'Session extra') : null),
     showProject ? el('p', { class: 'log-project' }, projectName(l.project)) : null,
     l.completed_by === state.data.user.name ? el('button', { type: 'button', class: 'link log-edit', onclick: () => openLogEdit(l) }, 'Edit') : null,
     el('dl', { class: 'log-notes' },
@@ -575,25 +616,26 @@ function field(label, input, hint) {
 function select(name, options, value) {
   return el('select', { name }, options.map(([v, l]) => el('option', { value: v, selected: String(v) === String(value ?? '') }, l)));
 }
-function showDialog(title, formKids, onSave, saveLabel, after) {
+function showDialog(title, formKids, onSave, saveLabel, after, extraButtons = []) {
   const dlg = $('dialog');
   const err = el('p', { class: 'form-error', role: 'alert' });
   const form = el('form', { method: 'dialog', class: 'form' },
     el('h2', {}, title), ...formKids, err,
     el('div', { class: 'form-actions' },
       el('button', { type: 'button', class: 'secondary', onclick: () => dlg.close() }, 'Cancel'),
+      extraButtons.map((b) => el('button', { type: 'submit', class: 'secondary', value: b.value }, b.label)),
       el('button', { type: 'submit', class: 'primary' }, saveLabel)));
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const btn = form.querySelector('.primary');
-    btn.disabled = true; err.textContent = '';
+    const btns = form.querySelectorAll('.form-actions button[type="submit"]');
+    btns.forEach((b) => { b.disabled = true; }); err.textContent = '';
     try {
       const values = Object.fromEntries(new FormData(form).entries());
-      await onSave(values, form);
+      await onSave(values, form, e.submitter);
       dlg.close();
       await load();
       if (after) after();
-    } catch (ex) { err.textContent = ex.message; } finally { btn.disabled = false; }
+    } catch (ex) { err.textContent = ex.message; } finally { btns.forEach((b) => { b.disabled = false; }); }
   });
   dlg.replaceChildren(form);
   dlg.showModal();
@@ -643,11 +685,17 @@ function openTask({ task, project, parent }) {
     el('div', { class: 'row' },
       field('Time type', select('time_type', typeOpts(projId), t.time_type || ''), 'Switch to Internal for setup, admin or anything not billed'),
       field('Blocked by', el('input', { name: 'blocked_by', value: t.blocked_by || '' }), 'Task IDs, like T-004')),
+    field('Repeats', select('repeat', [['', 'Does not repeat'], ...REPEATS.map((x) => [x, x])], t.repeat || ''),
+      'Checking off a repeating task logs it, then reopens it with the next due date'),
     field('Notes', el('textarea', { name: 'notes', rows: 2 }, t.notes || '')),
     cats,
   ], async (v) => {
     if (task) await post('ticket/update', { ticket_id: t.ticket_id, ...v });
-    else await post('ticket', v);
+    else {
+      const out = await post('ticket', v);
+      const newId = out.ticket_id || (out.ticket || {}).ticket_id;
+      if (v.repeat && newId) await post('ticket/update', { ticket_id: newId, repeat: v.repeat });
+    }
     status(task ? 'Task saved' : 'Task added');
   }, task ? 'Save task' : 'Add task');
 
@@ -695,15 +743,19 @@ function openComplete(t) {
   const kids = openDescendants(t);
   const parent = t.parent_ticket ? state.data.tickets.find((x) => x.ticket_id === t.parent_ticket) : null;
   const lastSub = parent && subtasksOf(parent).every((k) => k.ticket_id === t.ticket_id);
+  const repeats = REPEATS.includes(t.repeat);
+  const live = liveSession();
   showDialog('Check off task', [
     el('p', { class: 'form-sub' }, `${t.ticket_id} ${t.task}`),
+    repeats ? el('p', { class: 'form-warn' }, `This repeats ${t.repeat.toLowerCase()}. Checking it off saves this check-in to the Log and moves it to ${shortDate(nextDue(t))}.`) : null,
     kids.length ? el('p', { class: 'form-warn' }, `This also checks off its ${plural(kids.length, 'open subtask')} (${kids.map((k) => k.ticket_id).join(', ')}) with the note "Done with ${t.ticket_id}" and 0 min.`) : null,
     field('Summary or findings', doneBox(), 'Leave it as "done" or click in to write your own'),
-    el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Estimated time spent on task'), timeStepper('actual_hours', t.actual_hours)),
+    el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Estimated time spent on task'), timeStepper('actual_hours', repeats ? undefined : t.actual_hours)),
   ], async (v) => {
-    for (const k of kids) await post('ticket/update', { ticket_id: k.ticket_id, complete: { what_was_done: `Done with ${t.ticket_id}`, actual_hours: 0 } });
-    await post('ticket/update', { ticket_id: t.ticket_id, complete: v });
-    status('Checked off and saved to the log');
+    const sid = live ? { session_id: live.session_id } : {};
+    for (const k of kids) await post('ticket/update', { ticket_id: k.ticket_id, complete: { what_was_done: `Done with ${t.ticket_id}`, actual_hours: 0, ...sid } });
+    const out = await post('ticket/update', { ticket_id: t.ticket_id, complete: { ...v, ...sid } });
+    status(out.reopened ? `Logged. Next one is due ${shortDate(out.reopened)}` : 'Checked off and saved to the log');
   }, 'Check off', lastSub ? () => openParentPrompt(parent.ticket_id) : null);
 }
 
@@ -724,8 +776,16 @@ function openParentPrompt(id) {
 // Edit a checked-off Log entry: summary, time spent and time type
 function openLogEdit(l) {
   const p = projectOf(l.project) || {};
+  const loose = !l.ticket_id;
+  const removable = l.source === 'Extra' || l.source === 'Calendar';
   showDialog('Edit log entry', [
-    el('p', { class: 'form-sub' }, [l.ticket_id, l.task].filter(Boolean).join(' ')),
+    loose ? field('What was it', el('input', { name: 'task', value: l.task || '' }))
+      : el('p', { class: 'form-sub' }, [l.ticket_id, l.task].filter(Boolean).join(' ')),
+    loose ? field('Project', select('project', sortProjects([...state.data.projects]).map((x) => [x.project_id, x.display_name]), l.project)) : null,
+    removable ? el('button', { type: 'button', class: 'link remove', onclick: async () => {
+      if (!confirmInline(`Remove ${l.task} from the Log?`)) return;
+      try { await post('session', { action: 'log_delete', log_id: l.log_id }); $('dialog').close(); await load(); status('Entry removed'); } catch (ex) { status(`Could not remove: ${ex.message}`); }
+    } }, 'Remove this entry') : null,
     field('Summary or findings', el('textarea', { name: 'what_was_done', rows: 4 }, l.what_was_done || '')),
     el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Time spent'), timeStepper('actual_hours', l.actual_hours === '' ? 0 : l.actual_hours)),
     field('Time type', select('time_type', [['', `Project default (${p.time_type || 'Billable'})`], ...TIME_TYPES.map((x) => [x, x])], l.time_type || '')),
@@ -734,6 +794,15 @@ function openLogEdit(l) {
     if (l.ticket_id) await post('ticket/update', { ticket_id: l.ticket_id, actual_hours: v.actual_hours }).catch(() => {});
     status('Log entry saved');
   }, 'Save entry');
+}
+
+// Small in-page confirm (browser confirm boxes are avoided); second click within 4 seconds confirms
+function confirmInline(msg) {
+  const now = Date.now();
+  if (state.confirmMsg === msg && now - state.confirmAt < 4000) { state.confirmMsg = ''; return true; }
+  state.confirmMsg = msg; state.confirmAt = now;
+  status(`${msg} Click again to confirm`);
+  return false;
 }
 
 // Named links: a nickname plus the URL, one row each. The first row is the project folder.
@@ -790,8 +859,466 @@ function openProject(p) {
   }, p ? 'Save project' : 'Add project');
 }
 
+// ---------- sessions ----------
+const pad2 = (n) => String(n).padStart(2, '0');
+const nowHM = () => { const d = new Date(); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const todayIso = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+const hmToMin = (t) => { const m = /^(\d{1,2}):(\d{2})/.exec(String(t || '')); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+function clock(t) {
+  const m = hmToMin(t);
+  if (m === null) return t || '';
+  const h = Math.floor(m / 60) % 24;
+  return `${h % 12 || 12}:${pad2(m % 60)} ${h < 12 ? 'AM' : 'PM'}`;
+}
+const fmtMins = (mins) => { const h = Math.floor(mins / 60); const m = Math.round(mins % 60); return [h ? `${h} h` : '', m || !h ? `${m} min` : ''].filter(Boolean).join(' '); };
+const round2 = (n) => Math.round(n * 100) / 100;
+// "yyyy-MM-dd HH:mm" (how the webhooks stamp times) as a local Date
+const stampDate = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(String(s || '')); return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5]) : null; };
+
+const mySessions = () => (state.data.sessions || []);
+const liveSession = () => mySessions().find((s) => s.status === 'Open' || s.status === 'Paused') || null;
+const reviewSessions = () => mySessions().filter((s) => s.status === 'Needs review');
+// Log rows that belong to a session: tagged with it, or checked off after it started and not tagged yet
+function sessionLog(s) {
+  if (!s) return [];
+  const since = `${s.date} ${s.start}`;
+  return state.data.log.filter((l) => l.session_id === s.session_id
+    || (!l.session_id && l.completed_by === state.data.user.name && String(l.completed_at || '') >= since));
+}
+function sessionMinutes(s) {
+  const start = stampDate(`${s.date} ${s.start}`);
+  if (!start) return 0;
+  const until = s.status === 'Paused' ? (stampDate(s.paused_at) || new Date()) : new Date();
+  return Math.max(0, Math.round((until - start) / 60000) - (Number(s.break_minutes) || 0));
+}
+
+function renderSessionBar() {
+  if (!state.data) return;
+  const s = liveSession();
+  const review = reviewSessions();
+  $('session-btn').hidden = !!s;
+  const bar = $('session-bar');
+  const parts = [];
+  if (s) {
+    const paused = s.status === 'Paused';
+    const done = sessionLog(s).filter((l) => l.ticket_id).length;
+    parts.push(el('div', { class: `session-now${paused ? ' paused' : ''}` },
+      el('span', { class: 'session-dot', 'aria-hidden': 'true' }),
+      el('span', {}, paused ? `Paused at ${clock(String(s.paused_at).slice(11))}` : `Working since ${clock(s.start)}`),
+      el('strong', {}, fmtMins(sessionMinutes(s))),
+      done ? el('span', { class: 'session-count' }, `${plural(done, 'task')} checked off`) : null,
+      el('span', { class: 'session-actions' },
+        paused
+          ? el('button', { type: 'button', class: 'top-btn', onclick: () => sessionAction('resume') }, 'Resume')
+          : el('button', { type: 'button', class: 'top-btn', onclick: () => openPause() }, 'Pause'),
+        el('button', { type: 'button', class: 'top-btn solid', onclick: () => openEndSession(s) }, 'End session'))));
+  }
+  if (review.length) {
+    parts.push(el('div', { class: 'session-review' },
+      `${plural(review.length, 'session')} saved for review`,
+      el('button', { type: 'button', class: 'link', onclick: () => openEndSession(review[0], true) }, `Review ${shortDate(review[0].date)}`)));
+  }
+  bar.hidden = !parts.length;
+  bar.replaceChildren(el('div', { class: 'session-inner' }, parts));
+}
+
+async function sessionAction(action) {
+  try {
+    status(action === 'start' ? 'Starting session…' : 'Saving…');
+    await post('session', { action });
+    await load();
+    status(action === 'start' ? 'Session started' : action === 'pause' ? 'Session paused' : 'Session resumed');
+    setTimeout(() => status(''), 1500);
+  } catch (ex) { status(`Could not save: ${ex.message}`); }
+}
+
+// Pause now, and optionally get a reminder to come back after 15, 30 or 60 minutes
+function openPause() {
+  const dlg = $('dialog');
+  const pick = (mins) => async () => {
+    dlg.close();
+    await sessionAction('pause');
+    if (mins) {
+      clearTimeout(state.pauseTimer);
+      state.pauseTimer = setTimeout(() => {
+        status('Break is up. Press Resume when you are back.');
+        try { if (window.Notification && Notification.permission === 'granted') new Notification('Break is up', { body: 'Resume your session when you are back.' }); } catch (e) { /* no notifications here */ }
+      }, mins * 60000);
+      try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission(); } catch (e) { /* ignore */ }
+    }
+  };
+  dlg.replaceChildren(el('div', { class: 'form' },
+    el('h2', {}, 'Pause session'),
+    el('p', { class: 'form-sub' }, 'Paused time comes off the session hours.'),
+    el('div', { class: 'pause-picks' },
+      [15, 30, 60].map((m) => el('button', { type: 'button', class: 'secondary', onclick: pick(m) }, `${m} min`)),
+      el('button', { type: 'button', class: 'secondary', onclick: pick(0) }, 'Until I resume')),
+    el('div', { class: 'form-actions' }, el('button', { type: 'button', class: 'secondary', onclick: () => dlg.close() }, 'Cancel'))));
+  dlg.showModal();
+}
+
+const clientCode = (projectId) => (projectOf(projectId) || {}).client || 'WIPP';
+const typeOf = (l) => l.time_type || (state.data.tickets.find((t) => t.ticket_id === l.ticket_id) || {}).time_type || (projectOf(l.project) || {}).time_type || 'Billable';
+
+// Recap: one line per project. Timesheet line: one combined line, "CLIENT - item, item" per client, no periods.
+function buildRecap(items) {
+  const byProject = new Map();
+  for (const it of items) {
+    if (!it.task) continue;
+    const k = it.project || '';
+    if (!byProject.has(k)) byProject.set(k, []);
+    byProject.get(k).push(it.task + (it.hours ? ` (${fmtMins(it.hours * 60)})` : ''));
+  }
+  return [...byProject].map(([p, list]) => `${p ? projectName(p) : 'No project'}: ${list.join(', ')}`).join('\n');
+}
+function buildTimesheet(items) {
+  const byClient = new Map();
+  for (const it of items) {
+    if (!it.task) continue;
+    const k = it.project ? clientCode(it.project) : 'WIPP';
+    if (!byClient.has(k)) byClient.set(k, []);
+    const name = it.task.replace(/[.]+$/, '');
+    if (!byClient.get(k).includes(name)) byClient.get(k).push(name);
+  }
+  return [...byClient].map(([c, list]) => `${c} - ${list.join(', ')}`).join('; ').replace(/\./g, '');
+}
+
+function openEndSession(s, isReview = false) {
+  const d = state.data;
+  const entries = sessionLog(s);
+  const tasks = entries.filter((l) => l.source !== 'Extra' && l.source !== 'Calendar');
+  const extras = entries.filter((l) => l.source === 'Extra' || l.source === 'Calendar');
+  const removed = [];
+  const projOpts = [['', 'Choose a project'], ...sortProjects([...d.projects].filter((p) => !CLOSED.includes(p.status))).map((p) => [p.project_id, p.display_name])];
+  const typeOpts = [['', 'Project default'], ...TIME_TYPES.map((x) => [x, x])];
+  const live = !isReview && (s.status === 'Open' || s.status === 'Paused');
+  const pausedExtra = s.status === 'Paused' && stampDate(s.paused_at) ? Math.round((new Date() - stampDate(s.paused_at)) / 60000) : 0;
+
+  const startIn = el('input', { name: 'start', type: 'time', value: s.start || '' });
+  const endIn = el('input', { name: 'end', type: 'time', value: live ? nowHM() : (s.end || nowHM()) });
+  const brkIn = el('input', { name: 'break_minutes', type: 'number', min: 0, step: 5, value: (Number(s.break_minutes) || 0) + pausedExtra });
+  const hoursIn = el('input', { name: 'hours', type: 'number', min: 0, step: 0.05, value: '' });
+  let hoursTouched = isReview && s.hours !== '' && s.hours !== undefined;
+  if (hoursTouched) hoursIn.value = s.hours;
+  const totalLine = el('p', { class: 'field-hint session-total' });
+
+  const taskRows = el('div', { class: 'end-rows' }, tasks.length ? tasks.map((l) => el('div', { class: 'end-row', 'data-log': l.log_id },
+    el('div', { class: 'end-row-head' }, el('strong', {}, `${l.ticket_id} ${l.task}`), el('span', {}, projectName(l.project))),
+    el('textarea', { 'data-k': 'what_was_done', rows: 2, 'aria-label': `Summary for ${l.ticket_id}` }, l.what_was_done || ''),
+    el('div', { class: 'row' },
+      el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Time'), timeStepper(`t_${l.log_id}`, l.actual_hours === '' ? 0 : l.actual_hours)),
+      field('Time type', select(`tt_${l.log_id}`, typeOpts, l.time_type || ''))),
+  )) : [el('p', { class: 'meter-empty' }, 'No tasks checked off during this session yet.')]);
+
+  const extraRows = el('div', { class: 'end-rows' });
+  const addExtra = (x = {}) => {
+    const row = el('div', { class: 'end-row extra', 'data-log': x.log_id || '' },
+      el('div', { class: 'row' },
+        field('What was it', el('input', { 'data-k': 'task', value: x.task || '', placeholder: 'Client call, training video…' })),
+        field('Project', select('', projOpts, x.project || 'P-007'))),
+      el('div', { class: 'row' },
+        el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Time'), timeStepper(`x_${Math.random().toString(36).slice(2)}`, x.actual_hours === undefined || x.actual_hours === '' ? 0.5 : x.actual_hours)),
+        field('Time type', select('', typeOpts, x.time_type || ''))),
+      field('Note', el('input', { 'data-k': 'note', value: x.what_was_done || '' })),
+      x.source === 'Calendar' ? el('p', { class: 'field-hint' }, 'From your calendar') : null,
+      el('button', { type: 'button', class: 'link remove', onclick: () => { if (x.log_id) removed.push(x.log_id); row.remove(); updateTotal(); } }, 'Remove'));
+    row.querySelectorAll('select')[0].setAttribute('data-k', 'project');
+    row.querySelectorAll('select')[1].setAttribute('data-k', 'time_type');
+    row.addEventListener('click', () => setTimeout(updateTotal, 0));
+    extraRows.append(row);
+  };
+  extras.forEach(addExtra);
+
+  const recapBox = el('textarea', { name: 'recap', rows: 3 }, s.recap || '');
+  const sheetBox = el('textarea', { name: 'timesheet_line', rows: 2 }, s.timesheet_line || '');
+
+  // Everything in the popup as {task, project, hours}
+  const collect = () => {
+    const out = [];
+    taskRows.querySelectorAll('.end-row').forEach((r) => {
+      const l = tasks.find((x) => x.log_id === r.dataset.log);
+      out.push({ log_id: l.log_id, task: l.task, project: l.project, kind: 'task',
+        what_was_done: r.querySelector('[data-k="what_was_done"]').value,
+        hours: Number(r.querySelector(`[name="t_${l.log_id}"]`).value) || 0,
+        time_type: r.querySelector(`[name="tt_${l.log_id}"]`).value });
+    });
+    extraRows.querySelectorAll('.end-row').forEach((r) => {
+      out.push({ log_id: r.dataset.log || undefined, kind: 'extra',
+        task: r.querySelector('[data-k="task"]').value.trim(),
+        project: r.querySelector('[data-k="project"]').value,
+        hours: Number(r.querySelector('.stepper input[type="hidden"]').value) || 0,
+        time_type: r.querySelector('[data-k="time_type"]').value,
+        note: r.querySelector('[data-k="note"]').value.trim() });
+    });
+    return out;
+  };
+  const autoHours = () => {
+    const a = hmToMin(startIn.value); const b = hmToMin(endIn.value);
+    if (a === null || b === null) return '';
+    let span = b - a; if (span < 0) span += 1440;
+    return round2(Math.max(0, span - (Number(brkIn.value) || 0)) / 60);
+  };
+  function updateTotal() {
+    if (!hoursTouched) hoursIn.value = autoHours();
+    const sum = round2(collect().reduce((t, x) => t + x.hours, 0));
+    totalLine.textContent = `Tasks and extras add up to ${sum} h. Session is ${hoursIn.value || 0} h.`;
+  }
+  const rebuild = () => {
+    const items = collect();
+    recapBox.value = buildRecap(items);
+    sheetBox.value = buildTimesheet(items);
+  };
+  [startIn, endIn, brkIn].forEach((i) => i.addEventListener('input', updateTotal));
+  hoursIn.addEventListener('input', () => { hoursTouched = hoursIn.value !== ''; updateTotal(); });
+  taskRows.addEventListener('click', () => setTimeout(updateTotal, 0));
+
+  showDialog(isReview ? `Review session ${s.date}` : 'End session', [
+    el('div', { class: 'row' },
+      field('Date', el('input', { name: 'date', type: 'date', value: s.date || todayIso() })),
+      field('Start', startIn), field('End', endIn)),
+    el('div', { class: 'row' },
+      field('Break minutes', brkIn),
+      field('Session hours', hoursIn, 'Fills in from the times. Type to override')),
+    totalLine,
+    el('h3', { class: 'end-title' }, 'Tasks checked off'),
+    taskRows,
+    el('div', { class: 'end-title-row' }, el('h3', { class: 'end-title' }, 'Extras'),
+      el('button', { type: 'button', class: 'link', onclick: () => { addExtra(); updateTotal(); } }, 'Add an extra')),
+    el('p', { class: 'field-hint' }, 'Calls, meetings, videos or anything that was not a task'),
+    extraRows,
+    el('div', { class: 'end-title-row' }, el('h3', { class: 'end-title' }, 'Recap'),
+      el('button', { type: 'button', class: 'link', onclick: rebuild }, 'Rebuild from tasks and extras')),
+    field('By project', recapBox),
+    field('Timesheet line for Gusto', sheetBox, 'Copied when you save'),
+  ], async (v, form, submitter) => {
+    const items = collect();
+    const review = submitter && submitter.value === 'review';
+    await post('session', {
+      action: 'end', session_id: s.session_id, date: v.date, start: v.start, end: v.end,
+      break_minutes: v.break_minutes, hours: hoursTouched ? v.hours : '',
+      tasks: items.filter((x) => x.kind === 'task').map((x) => ({ log_id: x.log_id, actual_hours: x.hours, what_was_done: x.what_was_done, time_type: x.time_type })),
+      extras: items.filter((x) => x.kind === 'extra' && x.task).map((x) => ({ log_id: x.log_id, task: x.task, project: x.project, hours: x.hours, time_type: x.time_type, note: x.note })),
+      remove_log_ids: removed, recap: v.recap, timesheet_line: v.timesheet_line, review,
+    });
+    try { await navigator.clipboard.writeText(v.timesheet_line); } catch (e) { /* clipboard blocked */ }
+    status(review ? 'Saved for review later' : 'Session saved. Timesheet line copied');
+    setTimeout(() => status(''), 2500);
+  }, 'Save session', null, [{ label: 'Review later', value: 'review' }]);
+
+  if (!recapBox.value && !sheetBox.value) rebuild();
+  updateTotal();
+}
+
+// ---------- hours ----------
+const isoOf = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const parseIso = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s); return m ? new Date(+m[1], m[2] - 1, +m[3]) : null; };
+const addDays = (iso, n) => { const d = parseIso(iso); d.setDate(d.getDate() + n); return isoOf(d); };
+const mondayOf = (iso) => { const d = parseIso(iso); const back = (d.getDay() + 6) % 7; d.setDate(d.getDate() - back); return isoOf(d); };
+const shortDate = (iso) => { const d = parseIso(iso); return d ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : iso; };
+// completed_at can come back as "2026-11-21 13:05" or "11/21/2026 13:05"
+const logDay = (l) => { const v = String(l.completed_at || ''); return toIso(v.slice(0, 10)) || toIso(v.split(' ')[0]) || ''; };
+
+function weekSettings(ws) {
+  const row = (state.data.weeks || []).find((w) => String(w.week_start).slice(0, 10) === ws || toIso(String(w.week_start)) === ws);
+  const cap = row && row.capacity_hours !== '' ? Number(row.capacity_hours) : 40;
+  const frozen = row && row.frozen_hours !== '' ? Number(row.frozen_hours) : (ws < FULL_TIME_START ? DEFAULT_FROZEN : 0);
+  return { capacity: cap, frozen, notes: row ? row.notes : '', saved: !!row };
+}
+
+function weekData(ws) {
+  const we = addDays(ws, 7);
+  const me = state.data.user.name;
+  const entries = state.data.log.filter((l) => l.completed_by === me && logDay(l) >= ws && logDay(l) < we)
+    .map((l) => ({ ...l, _type: typeOf(l), _hours: Number(l.actual_hours) || 0, _day: logDay(l) }));
+  const byType = Object.fromEntries(TIME_TYPES.map((t) => [t, 0]));
+  for (const e of entries) byType[e._type] = round2((byType[e._type] || 0) + e._hours);
+  const total = round2(entries.reduce((t, e) => t + e._hours, 0));
+  const sessions = mySessions().filter((s) => s.date >= ws && s.date < we && s.status !== 'Open' && s.status !== 'Paused');
+  return { entries, byType, total, sessions };
+}
+
+function copyButton(getText, label = 'Copy list') {
+  return el('button', { type: 'button', class: 'link', onclick: async () => {
+    try { await navigator.clipboard.writeText(getText()); status('Copied'); } catch (e) { status('Copy was blocked by the browser'); }
+    setTimeout(() => status(''), 1500);
+  } }, label);
+}
+
+function renderHours() {
+  const view = $('view-hours');
+  if (!state.week) state.week = mondayOf(todayIso());
+  const ws = state.week;
+  const set = weekSettings(ws);
+  const available = Math.max(0, set.capacity - set.frozen);
+  const w = weekData(ws);
+  const left = round2(available - w.total);
+  const scale = available / 40;
+
+  // Week bar: logged time by type, then what's left, then frozen hours
+  const segs = [...TIME_TYPES.map((t) => [t, w.byType[t]]), ['Left', Math.max(0, left)], ['Frozen', set.frozen]].filter(([, h]) => h > 0);
+  const barTotal = Math.max(set.capacity, w.total + set.frozen) || 1;
+  const bar = el('div', { class: 'week-bar', role: 'img', 'aria-label': `${w.total} of ${available} hours logged` },
+    segs.map(([t, h]) => el('div', { class: 'week-seg', 'data-type': t, style: `flex: ${h} 1 0`, title: `${t}: ${h} h` },
+      (h / barTotal) > 0.07 ? el('span', {}, `${round2(h)}`) : null)));
+
+  const framework = FRAMEWORK.map(([label, types, lo, hi, hint]) => {
+    const got = round2(types.reduce((t, x) => t + (w.byType[x] || 0), 0));
+    const min = round2(lo * scale); const max = round2(hi * scale);
+    const note = got < min ? `${round2(min - got)} h under` : got > max ? `${round2(got - max)} h over` : 'In range';
+    const top = Math.max(max * 1.25, got, 1);
+    return el('div', { class: 'fw-row' },
+      el('div', { class: 'fw-head' }, el('strong', {}, label), el('span', {}, `${got} h of ${min} to ${max} h`), el('span', { class: `fw-note${note === 'In range' ? ' ok' : ''}` }, note)),
+      el('div', { class: 'fw-track' },
+        el('div', { class: 'fw-range', style: `left: ${(min / top) * 100}%; width: ${((max - min) / top) * 100}%` }),
+        el('div', { class: 'fw-fill', 'data-type': types[0], style: `width: ${Math.min(100, (got / top) * 100)}%` })),
+      el('p', { class: 'field-hint' }, hint));
+  });
+
+  // Day by day
+  const days = [...Array(7)].map((_, i) => addDays(ws, i));
+  const dayRow = el('div', { class: 'day-row' }, days.map((day) => {
+    const h = round2(w.entries.filter((e) => e._day === day).reduce((t, e) => t + e._hours, 0));
+    const sh = round2(w.sessions.filter((s) => s.date === day).reduce((t, s) => t + (Number(s.hours) || 0), 0));
+    return el('div', { class: `day${day === todayIso() ? ' today' : ''}` },
+      el('span', { class: 'day-name' }, parseIso(day).toLocaleDateString('en-US', { weekday: 'short' })),
+      el('strong', {}, h ? `${h} h` : '–'),
+      sh ? el('span', { class: 'day-sess' }, `session ${sh} h`) : null);
+  }));
+
+  // By project
+  const projIds = [...new Set(w.entries.map((e) => e.project))];
+  const projRows = sortProjects(projIds.map((id) => projectOf(id) || { project_id: id, display_name: id || 'No project', status: '' })).map((p) => {
+    const mine = w.entries.filter((e) => e.project === p.project_id);
+    const h = round2(mine.reduce((t, e) => t + e._hours, 0));
+    const split2 = TIME_TYPES.map((t) => [t, round2(mine.filter((e) => e._type === t).reduce((s, e) => s + e._hours, 0))]).filter(([, x]) => x);
+    const weekly = Number(p.weekly_hours) || 0;
+    return el('tr', {},
+      el('td', {}, p.project_id && projectOf(p.project_id) ? el('a', { class: 'project-link', href: `#project/${encodeURIComponent(p.project_id)}` }, p.display_name) : p.display_name),
+      el('td', {}, el('div', { class: 'type-chips' }, split2.map(([t, x]) => el('span', { class: 'type-chip', 'data-type': t }, `${t} ${x}`)))),
+      el('td', { class: 'num' }, `${h} h`),
+      el('td', { class: 'num' }, weekly ? `${weekly} h` : ''),
+      el('td', { class: 'num' }, projectOf(p.project_id) ? hoursText(p) : ''));
+  });
+
+  // Client-facing billable lists, plus Internal time on client projects for the boss
+  const clientGroups = (type, onlyClients) => {
+    const groups = new Map();
+    for (const e of w.entries.filter((x) => x._type === type)) {
+      const p = projectOf(e.project) || {};
+      if (onlyClients && isSecondary(p)) continue;
+      const c = p.client || 'WIPP';
+      if (!groups.has(c)) groups.set(c, []);
+      groups.get(c).push(e);
+    }
+    return [...groups];
+  };
+  const listText = (c, list, label) => [`Week of ${shortDate(ws)} - ${c} ${label}`,
+    ...list.map((e) => `${[e.ticket_id, e.task].filter(Boolean).join(' ')} - ${e._hours} h`),
+    `Total ${round2(list.reduce((t, e) => t + e._hours, 0))} h`].join('\n');
+  const groupPanel = (title, groups, label, empty) => el('div', { class: 'panel' },
+    el('h3', {}, title),
+    groups.length ? groups.map(([c, list]) => el('div', { class: 'bill-group' },
+      el('div', { class: 'projects-head' },
+        el('strong', {}, `${c}: ${round2(list.reduce((t, e) => t + e._hours, 0))} h`),
+        copyButton(() => listText(c, list, label))),
+      el('ul', { class: 'bill-list' }, list.map((e) => el('li', {},
+        el('span', {}, [e.ticket_id, e.task].filter(Boolean).join(' ')),
+        el('span', { class: 'num' }, `${e._hours} h`)))))) : el('p', { class: 'meter-empty' }, empty));
+
+  const noTime = w.entries.filter((e) => !e._hours).length;
+
+  view.replaceChildren(
+    el('div', { class: 'projects-head' },
+      el('h2', { id: 'hours-title' }, 'Hours'),
+      el('div', { class: 'week-nav' },
+        el('button', { type: 'button', class: 'secondary nav-btn', 'aria-label': 'Previous week', onclick: () => { state.week = addDays(ws, -7); render(); } }, '‹'),
+        el('strong', {}, `Week of ${shortDate(ws)} to ${shortDate(addDays(ws, 6))}`),
+        el('button', { type: 'button', class: 'secondary nav-btn', 'aria-label': 'Next week', onclick: () => { state.week = addDays(ws, 7); render(); } }, '›'),
+        ws !== mondayOf(todayIso()) ? el('button', { type: 'button', class: 'link', onclick: () => { state.week = mondayOf(todayIso()); render(); } }, 'This week') : null)),
+    el('div', { class: 'tiles' },
+      el('div', { class: 'tile' }, el('span', {}, 'Logged'), el('strong', {}, `${w.total} h`), el('span', {}, `of ${available} h available`)),
+      el('div', { class: 'tile' }, el('span', {}, left >= 0 ? 'Left' : 'Over'), el('strong', {}, `${Math.abs(left)} h`), el('span', {}, 'this week')),
+      el('div', { class: 'tile' }, el('span', {}, 'Frozen'), el('strong', {}, `${set.frozen} h`), el('span', {}, set.frozen ? `of ${set.capacity} h` : 'none this week')),
+      el('div', { class: 'tile' }, el('span', {}, 'Sessions'), el('strong', {}, `${round2(w.sessions.reduce((t, s) => t + (Number(s.hours) || 0), 0))} h`), el('span', {}, plural(w.sessions.length, 'session')))),
+    el('div', { class: 'panel' },
+      el('div', { class: 'projects-head' }, el('h3', {}, 'This week'),
+        el('button', { type: 'button', class: 'link', onclick: () => openWeekEdit(ws, set) }, 'Adjust this week')),
+      set.notes ? el('p', { class: 'field-hint' }, set.notes) : null,
+      bar,
+      el('div', { class: 'legend' }, [...TIME_TYPES, 'Left', 'Frozen'].map((t) => el('span', { 'data-type': t }, t))),
+      dayRow,
+      noTime ? el('p', { class: 'field-hint' }, `${plural(noTime, 'entry')} this week ${noTime === 1 ? 'has' : 'have'} no time. Add it with Edit in the Log.`) : null),
+    el('div', { class: 'panel' },
+      el('h3', {}, '40-hour framework'),
+      el('p', { class: 'field-hint' }, scale === 1 ? 'Targets for a full 40-hour week' : `Targets scaled to your ${available} available hours`),
+      framework),
+    el('div', { class: 'panel' },
+      el('h3', {}, 'By project'),
+      projRows.length ? el('div', { class: 'table-wrap flat' }, el('table', { class: 'tasks-table hours-table' },
+        el('thead', {}, el('tr', {}, ['Project', 'Time types', 'This week', 'Weekly target', 'Total'].map((h, i) => el('th', { scope: 'col', class: i > 1 ? 'num' : null }, el('span', { class: 'th' }, h))))),
+        el('tbody', {}, projRows))) : el('p', { class: 'meter-empty' }, 'Nothing logged this week yet.')),
+    el('div', { class: 'page-grid' },
+      groupPanel('Billable by client', clientGroups('Billable', false), 'billable', 'No billable time this week yet.'),
+      groupPanel('Internal time on client projects', clientGroups('Internal', true), 'internal (not billed)', 'No internal time on client projects this week.')),
+    el('div', { class: 'panel' },
+      el('h3', {}, 'Sessions'),
+      w.sessions.length ? el('ol', { class: 'log-list' }, w.sessions.map((s) => el('li', { class: 'log-item' },
+        el('div', { class: 'log-head' },
+          el('strong', {}, `${shortDate(s.date)}, ${clock(s.start)} to ${clock(s.end)}`),
+          el('span', {}, [`${s.hours} h`, s.status === 'Needs review' ? 'Needs review' : ''].filter(Boolean).join(', '))),
+        s.timesheet_line ? el('p', { class: 'sheet-line' }, s.timesheet_line) : null,
+        el('div', { class: 'card-actions' },
+          s.timesheet_line ? copyButton(() => s.timesheet_line, 'Copy timesheet line') : null,
+          el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit'))))) : el('p', { class: 'meter-empty' }, 'No finished sessions this week.')),
+  );
+}
+
+function openWeekEdit(ws, set) {
+  showDialog(`Adjust week of ${shortDate(ws)}`, [
+    el('div', { class: 'row' },
+      field('Capacity hours', el('input', { name: 'capacity_hours', type: 'number', min: 0, step: 0.25, value: set.capacity })),
+      field('Frozen hours', el('input', { name: 'frozen_hours', type: 'number', min: 0, step: 0.25, value: set.frozen }), 'Hours held back, like the 15 until Jan 11')),
+    field('Notes', el('input', { name: 'notes', value: set.notes || '' })),
+  ], async (v) => {
+    await post('session', { action: 'week_save', week_start: ws, ...v });
+    status('Week saved');
+  }, 'Save week');
+}
+
+// Next due date for a repeating task, same rule as the webhook (always after today)
+function nextDue(t) {
+  let d = parseIso(toIso(t.due_date) || todayIso());
+  const today = parseIso(todayIso());
+  do {
+    if (t.repeat === 'Monthly') d.setMonth(d.getMonth() + 1);
+    else d.setDate(d.getDate() + (t.repeat === 'Every 2 weeks' ? 14 : 7));
+  } while (d <= today);
+  return isoOf(d);
+}
+
 // ---------- events ----------
-window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
+window.addEventListener('hashchange', () => {
+  const v = route().view;
+  // A project page opens focused (Up next tucked away); Back to the dashboard returns to the dual layout
+  if (v === 'project' && state.lastView !== 'project') state.projLayout = 'projects';
+  if (v === 'home' && state.lastView === 'project') state.layout = 'split';
+  state.lastView = v;
+  render();
+  window.scrollTo(0, 0);
+});
+$('push-left').addEventListener('click', pushLeft);
+$('push-right').addEventListener('click', pushRight);
+$('strip-left').addEventListener('click', () => setLayout('split'));
+$('strip-right').addEventListener('click', () => setLayout('split'));
+$('next-fold').addEventListener('click', () => {
+  state.nextFolded = !state.nextFolded;
+  applyLayout(route().view);
+  if (state.nextFolded) {
+    const target = route().view === 'project' ? $('view-project') : $('view-home');
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+$('session-btn').addEventListener('click', () => sessionAction('start'));
 $('refresh').addEventListener('click', () => load());
 $('new-task').addEventListener('click', () => state.data && openTask({}));
 $('new-project').addEventListener('click', () => state.data && openProject(null));
@@ -803,4 +1330,7 @@ $('gate-form').addEventListener('submit', (e) => {
   load();
 });
 
+state.lastView = route().view;
 load();
+// Keep the session timer fresh
+setInterval(() => { if (state.data && liveSession()) renderSessionBar(); }, 30000);
