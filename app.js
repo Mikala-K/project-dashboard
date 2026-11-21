@@ -158,7 +158,8 @@ async function load(retried = false) {
     const body = await res.json().catch(() => ({}));
     if (res.status === 401) { showGate('That key did not work. Check your dashboard link.'); status(''); return; }
     if (!res.ok || !body.ok) throw new Error(body.error || `Server answered ${res.status}`);
-    body.log = body.log || [];
+    // Marker rows left by removed calendar meetings never show on the page
+    body.log = (body.log || []).filter((l) => l.source !== 'Removed' && (l.log_id || l.task));
     state.data = body;
     $('gate').hidden = true;
     render();
