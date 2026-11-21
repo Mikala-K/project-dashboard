@@ -193,10 +193,11 @@ function taskRow(t, opts = {}) {
   const expanded = opts.expandAll || state.openTasks.has(t.ticket_id);
   const meta = [
     opts.showProject ? projectName(t.project) : null,
-    `${t._priority || t.priority || 'Low'} priority${t._from ? `, from ${t._from}` : ''}`,
+    // Up next stays lean: the color bar shows priority, the card shows project, due date and parent only
+    opts.markSub ? null : `${t.priority || 'Low'} priority`,
     t.due_date ? `Due ${t.due_date}` : null,
     t.status !== 'Open' ? t.status : null,
-    t.category || null,
+    opts.markSub ? null : (t.category || null),
     opts.showAssignee ? (t.assignee || 'Unassigned') : null,
     t.blocked_by ? `Waiting on ${t.blocked_by}` : null,
   ].filter(Boolean);
