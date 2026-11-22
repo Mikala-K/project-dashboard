@@ -118,6 +118,18 @@ function nextStep(t) {
   const kids = sortSubs(subtasksOf(t)).filter((k) => k.status !== 'Backlog');
   return kids.length ? nextStep(kids[0]) : t;
 }
+// Repeating tasks stay out of Up next until the day before they're due.
+// Their priority climbs on its own: Low until then, Medium the day before, High on the due date (or overdue).
+function repeatState(t) {
+  if (!REPEATS.includes(t.repeat)) return null;
+  const due = toIso(t.due_date);
+  if (!due) return { show: true, priority: t.priority || 'Low' };
+  const today = todayIso();
+  if (due <= today) return { show: true, priority: 'High' };
+  if (due === addDays(today, 1)) return { show: true, priority: 'Medium' };
+  return { show: false, priority: 'Low' };
+}
+const effPriority = (t) => (repeatState(t) || {}).priority || t.priority || 'Low';
 const topRank = (a, b) => Math.min(PRIORITY_RANK[a] ?? 2, PRIORITY_RANK[b] ?? 2);
 const RANK_NAME = ['High', 'Medium', 'Low'];
 function upNext() {
@@ -126,15 +138,15 @@ function upNext() {
   const me = d.user.name;
   const seen = new Set();
   return d.tickets
-    .filter((t) => isTopLevel(t, ids) && t.status !== 'Backlog')
+    .filter((t) => isTopLevel(t, ids) && t.status !== 'Backlog' && (repeatState(t) || {}).show !== false)
     .map((root) => {
       const step = nextStep(root);
       const mine = split(step.assignee).includes(me) || (!step.assignee && step !== root && split(root.assignee).includes(me));
       if (!mine || seen.has(step.ticket_id)) return null;
       seen.add(step.ticket_id);
       const parent = step === root ? null : d.tickets.find((x) => x.ticket_id === step.parent_ticket);
-      const eff = RANK_NAME[topRank(step.priority, root.priority)];
-      return { ...step, _priority: eff, _from: eff !== (step.priority || 'Low') ? root.ticket_id : '', _parent: parent };
+      const eff = RANK_NAME[topRank(effPriority(step), effPriority(root))];
+      return { ...step, _priority: eff, _from: eff !== effPriority(step) ? root.ticket_id : '', _parent: parent };
     })
     .filter(Boolean)
     .sort((a, b) => {
@@ -233,7 +245,7 @@ function taskRow(t, opts = {}) {
   const meta = [
     opts.showProject ? projectName(t.project) : null,
     // Up next stays lean: the color bar shows priority, the card shows project, due date and parent only
-    opts.markSub ? null : `${t.priority || 'Low'} priority`,
+    opts.markSub ? null : `${effPriority(t)} priority`,
     t.due_date ? `Due ${t.due_date}` : null,
     !opts.markSub && REPEATS.includes(t.repeat) ? `Repeats ${t.repeat.toLowerCase()}` : null,
     t.status !== 'Open' ? t.status : null,
@@ -242,7 +254,7 @@ function taskRow(t, opts = {}) {
     t.blocked_by ? `Waiting on ${t.blocked_by}` : null,
   ].filter(Boolean);
   const parent = opts.markSub && t.parent_ticket ? (t._parent || state.data.tickets.find((x) => x.ticket_id === t.parent_ticket)) : null;
-  const li = el('li', { class: 'task', 'data-priority': t._priority || t.priority || 'Low' },
+  const li = el('li', { class: 'task', 'data-priority': t._priority || effPriority(t) },
     el('input', { type: 'checkbox', class: 'tick', 'aria-label': `Check off ${t.task}`, onchange: (e) => { e.target.checked = false; openComplete(t); } }),
     el('div', {},
       el('button', { type: 'button', class: 'task-open', onclick: () => openTask({ task: t }) },
@@ -564,7 +576,7 @@ function renderTasks() {
         : (t.category || '')),
       assignee: el('td', {}, state.ticketing ? pick(t, 'assignee', [['', 'Unassigned'], ...d.people.map((n) => [n, n])], 'Assignee') : (t.assignee || 'Unassigned')),
       priority: el('td', {}, state.ticketing ? pick(t, 'priority', [['High', 'High'], ['Medium', 'Medium'], ['Low', 'Low']], 'Priority')
-        : el('span', { class: 'pill', 'data-priority': t.priority }, t.priority || 'Low')),
+        : el('span', { class: 'pill', 'data-priority': effPriority(t) }, effPriority(t))),
       status: el('td', {}, state.ticketing ? pick(t, 'status', TASK_STATUSES.map((s) => [s, s]), 'Status') : t.status),
       milestone_id: el('td', {}, pick(t, 'milestone_id', [['', 'None'], ...d.milestones.filter((m) => m.project_id === t.project).map((m) => [m.milestone_id, m.milestone])], 'Milestone')),
       due_date: el('td', { class: 'nowrap' }, t.due_date || ''),
@@ -587,7 +599,10 @@ function renderTasks() {
 
 // ---------- log ----------
 function logList(entries, showProject) {
-  return el('ol', { class: 'log-list' }, entries.map((l) => el('li', { class: 'log-item' },
+  return el('ol', { class: 'log-list' }, entries.map((l) => logItem(l, showProject)));
+}
+function logItem(l, showProject) {
+  return el('li', { class: 'log-item' },
     el('div', { class: 'log-head' },
       el('strong', {}, [l.ticket_id, l.task].filter(Boolean).join(' ')),
       el('span', {}, [l.completed_at, l.completed_by, l.actual_hours ? `${l.actual_hours} h` : ''].filter(Boolean).join(', '))),
@@ -600,18 +615,53 @@ function logList(entries, showProject) {
     el('dl', { class: 'log-notes' },
       l.what_changed ? [el('dt', {}, 'Changed or found'), el('dd', {}, l.what_changed)] : null,
       l.next_steps ? [el('dt', {}, 'Next'), el('dd', {}, l.next_steps)] : null),
-  )));
+  );
+}
+
+// "yyyy-MM-dd HH:mm" for sorting, whichever way the sheet wrote the date
+const stampOf = (v) => { const s = String(v || ''); const day = toIso(s.slice(0, 10)) || toIso(s.split(' ')[0]); const time = (s.match(/(\d{1,2}:\d{2})/) || [])[1] || '00:00'; return day ? `${day} ${time.padStart(5, '0')}` : ''; };
+function sessionGroup(s, entries, isLive) {
+  const projects = [...new Set(entries.map((l) => l.project).filter(Boolean))];
+  const hours = isLive ? round2(sessionMinutes(s) / 60) : (s.hours || 0);
+  const when = isLive ? `In progress since ${clock(s.start)}${s.status === 'Paused' ? ' (paused)' : ''}` : `${clock(s.start)} to ${clock(s.end)}`;
+  return el('li', { class: `session-group${isLive ? ' live' : ''}` },
+    el('div', { class: 'log-head' },
+      el('strong', {}, `Session, ${shortDate(s.date)}`),
+      el('span', {}, [when, `${hours} h`, s.status === 'Needs review' ? 'needs review' : ''].filter(Boolean).join(', '))),
+    projects.length ? el('div', { class: 'type-chips' }, projects.map((p) => el('span', { class: 'type-chip' }, projectName(p)))) : null,
+    el('div', { class: 'card-actions' },
+      s.timesheet_line ? copyButton(() => s.timesheet_line, 'Copy snippet') : null,
+      isLive ? el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s) }, 'End session')
+        : el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit')),
+    entries.length ? el('ol', { class: 'log-list nested' }, entries.map((l) => logItem(l, false)))
+      : el('p', { class: 'meter-empty' }, 'Nothing checked off in this session yet.'));
 }
 function renderLog() {
   const d = state.data;
   const projects = sortProjects(d.projects.filter((p) => d.log.some((l) => l.project === p.project_id)));
   $('log-filters').replaceChildren(field('Project', el('select', { onchange: (e) => { state.logProject = e.target.value; render(); } },
     [['', 'All projects'], ...projects.map((p) => [p.project_id, p.display_name])].map(([v, l]) => el('option', { value: v, selected: state.logProject === v }, l)))));
-  const done = mySessions().filter((s) => s.status === 'Done' || s.status === 'Needs review').slice(0, 10);
-  $('log-sessions').replaceChildren(el('h3', {}, 'Recent sessions'),
-    done.length ? sessionList(done) : el('p', { class: 'meter-empty' }, 'Finished sessions show up here with a Copy snippet button for Gusto.'));
-  const entries = d.log.filter((l) => !state.logProject || l.project === state.logProject);
-  $('log-list').replaceChildren(entries.length ? logList(entries, true) : el('p', { class: 'meter-empty' }, 'Checked-off tasks show up here with your notes.'));
+  const match = (l) => !state.logProject || l.project === state.logProject;
+  const live = liveSession();
+  const claimed = new Set();
+  const items = [];
+  for (const s of mySessions()) {
+    const isLive = live && s.session_id === live.session_id;
+    const entries = (isLive ? sessionLog(s) : d.log.filter((l) => l.session_id === s.session_id))
+      .sort((a, b) => stampOf(b.completed_at).localeCompare(stampOf(a.completed_at)));
+    entries.forEach((l) => claimed.add(l.log_id));
+    const shown = entries.filter(match);
+    if (state.logProject && !shown.length) continue;
+    const at = isLive ? '9999' : `${s.date} ${String(s.end || s.start || '').padStart(5, '0')}`;
+    items.push({ at, node: sessionGroup(s, shown, isLive) });
+  }
+  for (const l of d.log) {
+    if (claimed.has(l.log_id) || !match(l)) continue;
+    items.push({ at: stampOf(l.completed_at), node: logItem(l, true) });
+  }
+  items.sort((a, b) => b.at.localeCompare(a.at));
+  $('log-list').replaceChildren(items.length ? el('ol', { class: 'log-list' }, items.map((i) => i.node))
+    : el('p', { class: 'meter-empty' }, 'Checked-off tasks and sessions show up here, newest first.'));
 }
 
 // ---------- dialogs ----------
@@ -691,7 +741,7 @@ function openTask({ task, project, parent }) {
       field('Time type', select('time_type', typeOpts(projId), t.time_type || ''), 'Switch to Internal for setup, admin or anything not billed'),
       field('Blocked by', el('input', { name: 'blocked_by', value: t.blocked_by || '' }), 'Task IDs, like T-004')),
     field('Repeats', select('repeat', [['', 'Does not repeat'], ...REPEATS.map((x) => [x, x])], t.repeat || ''),
-      'Checking off a repeating task logs it, then reopens it with the next due date'),
+      'Checking it off logs it and reopens it with the next due date. It stays out of Up next until the day before (Medium), then turns High on the due date'),
     field('Notes', el('textarea', { name: 'notes', rows: 2 }, t.notes || '')),
     cats,
   ], async (v) => {

@@ -465,7 +465,7 @@ a.link { text-decoration: none; }
 .pace { position: relative; height: 16px; background: var(--header); border-radius: 8px; overflow: visible; }
 .pace-fill { position: absolute; inset: 3px auto 3px 3px; border-radius: 6px; background: linear-gradient(90deg, var(--accent), var(--link)); }
 .pace-mark { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--ink); border-radius: 1px; }
-.pace-mark::after { content: attr(data-label); position: absolute; top: 22px; left: 50%; transform: translateX(-50%); font-size: 11px; color: var(--ink-soft); white-space: nowrap; }
+.pace-mark::after { content: attr(data-label); position: absolute; top: 22px; right: 0; font-size: 11px; color: var(--ink-soft); white-space: nowrap; }
 .week-num { font-family: var(--font-head); font-size: 22px; white-space: nowrap; }
 .week-num small { font-family: var(--font-body); font-size: 13px; color: var(--ink-soft); margin-left: 4px; }
 .week-card .pace-wrap { padding-bottom: 14px; }
@@ -475,3 +475,10 @@ a.link { text-decoration: none; }
 .sess-list li { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; background: var(--paper); border-radius: var(--radius-sm); padding: 8px 12px; font-size: 14px; }
 .sess-list li .grow { flex: 1; }
 .sess-list .muted { color: var(--ink-soft); }
+
+/* Log timeline: a session holds what was done during it */
+.session-group { background: var(--panel); border-radius: var(--radius-sm); padding: 12px 14px; border-left: 4px solid var(--accent); }
+.session-group.live { border-left-color: var(--low); }
+.session-group > .log-head strong { font-family: var(--font-head); font-weight: 500; font-size: 17px; }
+.log-list.nested { margin-top: 10px; gap: 8px; }
+.log-list.nested .log-item { background: var(--paper); }
