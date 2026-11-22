@@ -317,8 +317,25 @@ function renderChips() {
   $('client-chips').replaceChildren(make('all', 'All clients'), ...d.clients.map((c) => make(c.client, c.client)));
 }
 
+// Pinned projects sit at the top of the list, whatever their status
+function pinButton(p) {
+  const on = isPinned(p);
+  return el('button', { type: 'button', class: `pin-btn${on ? ' on' : ''}`, 'aria-pressed': String(on),
+    'aria-label': on ? `Unpin ${p.display_name}` : `Pin ${p.display_name} to the top`, title: on ? 'Unpin' : 'Pin to the top',
+    onclick: async () => {
+      p.pinned = on ? '' : 'yes';
+      render();
+      try { await post('project', { project_id: p.project_id, pinned: p.pinned }); }
+      catch (ex) { p.pinned = on ? 'yes' : ''; render(); status(`Could not save: ${ex.message}`); }
+    } },
+  );
+}
+// SVG needs its own namespace, so the pin icon is set as markup
+const PIN_SVG = (on) => `<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M15 3l6 6-3 1-4 4 1 5-2 2-4-4-5 5-1-1 5-5-4-4 2-2 5 1 4-4z" fill="${on ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`;
+const isPinned = (p) => String(p.pinned || '').toLowerCase() === 'yes';
 function sortProjects(list) {
-  return list.sort((a, b) => statusRank(a.status) - statusRank(b.status)
+  return list.sort((a, b) => isPinned(b) - isPinned(a)
+    || statusRank(a.status) - statusRank(b.status)
     || isSecondary(a) - isSecondary(b)
     || tasksOfProject(b.project_id).length - tasksOfProject(a.project_id).length
     || a.display_name.localeCompare(b.display_name));
@@ -388,6 +405,7 @@ function projectCard(p) {
         } }, open ? 'Hide tasks' : `Show tasks (${top.length})`),
         el('button', { type: 'button', class: 'link', onclick: () => openTask({ project: p.project_id }) }, 'Add task'),
         el('a', { class: 'link', href: `#project/${encodeURIComponent(p.project_id)}` }, 'Open project'),
+        (() => { const b = pinButton(p); b.innerHTML = PIN_SVG(isPinned(p)); return b; })(),
       ),
       open ? (top.length ? el('ul', { class: 'task-list' }, top.map((t) => taskRow(t, { withSubtasks: true, showAssignee: true })))
         : el('p', { class: 'meter-empty' }, 'No open tasks on this project.')) : null,

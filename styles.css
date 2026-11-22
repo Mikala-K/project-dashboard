@@ -500,3 +500,7 @@ details.session-group > .type-chips, details.session-group > .card-actions { mar
 .end-summary strong { font-family: var(--font-head); font-weight: 500; font-size: 18px; }
 .end-summary .worked strong { color: var(--link); }
 .end-row.misc { border-style: dashed; }
+
+.pin-btn { margin-left: auto; background: none; border: 1px solid transparent; border-radius: 50%; width: 30px; height: 30px; display: grid; place-items: center; color: var(--ink-soft); padding: 0; }
+.pin-btn:hover { color: var(--link); border-color: var(--line); }
+.pin-btn.on { color: var(--link); }
