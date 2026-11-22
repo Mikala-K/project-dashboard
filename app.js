@@ -214,6 +214,7 @@ function render() {
   $('app').classList.toggle('full', wide);
   applyLayout(r.view);
   renderSessionBar();
+  renderWeekStrip(r.view);
   document.querySelectorAll('.tabs a').forEach((a) => a.setAttribute('aria-current', a.dataset.view === r.view ? 'page' : 'false'));
   renderNext();
   if (r.view === 'home') { renderChips(); renderProjects(); }
@@ -595,8 +596,8 @@ function logList(entries, showProject) {
       l.source === 'Calendar' || l.source === 'Extra' ? el('span', { class: 'type-chip' }, l.source === 'Calendar' ? 'From calendar' : 'Session extra') : null),
     showProject ? el('p', { class: 'log-project' }, projectName(l.project)) : null,
     l.completed_by === state.data.user.name ? el('button', { type: 'button', class: 'link log-edit', onclick: () => openLogEdit(l) }, 'Edit') : null,
+    l.what_was_done ? el('p', { class: 'log-summary' }, l.what_was_done) : null,
     el('dl', { class: 'log-notes' },
-      l.what_was_done ? [el('dt', {}, 'Done'), el('dd', {}, l.what_was_done)] : null,
       l.what_changed ? [el('dt', {}, 'Changed or found'), el('dd', {}, l.what_changed)] : null,
       l.next_steps ? [el('dt', {}, 'Next'), el('dd', {}, l.next_steps)] : null),
   )));
@@ -606,6 +607,9 @@ function renderLog() {
   const projects = sortProjects(d.projects.filter((p) => d.log.some((l) => l.project === p.project_id)));
   $('log-filters').replaceChildren(field('Project', el('select', { onchange: (e) => { state.logProject = e.target.value; render(); } },
     [['', 'All projects'], ...projects.map((p) => [p.project_id, p.display_name])].map(([v, l]) => el('option', { value: v, selected: state.logProject === v }, l)))));
+  const done = mySessions().filter((s) => s.status === 'Done' || s.status === 'Needs review').slice(0, 10);
+  $('log-sessions').replaceChildren(el('h3', {}, 'Recent sessions'),
+    done.length ? sessionList(done) : el('p', { class: 'meter-empty' }, 'Finished sessions show up here with a Copy snippet button for Gusto.'));
   const entries = d.log.filter((l) => !state.logProject || l.project === state.logProject);
   $('log-list').replaceChildren(entries.length ? logList(entries, true) : el('p', { class: 'meter-empty' }, 'Checked-off tasks show up here with your notes.'));
 }
@@ -694,7 +698,12 @@ function openTask({ task, project, parent }) {
     if (task) await post('ticket/update', { ticket_id: t.ticket_id, ...v });
     else {
       const out = await post('ticket', v);
-      const newId = out.ticket_id || (out.ticket || {}).ticket_id;
+      let newId = out.ticket_id || (out.ticket || {}).ticket_id;
+      if (v.repeat && !newId) {
+        await load();
+        const mine = state.data.tickets.filter((x) => x.task === v.task.trim() && !x.repeat).sort((a, b) => idNum(b.ticket_id) - idNum(a.ticket_id));
+        newId = mine.length ? mine[0].ticket_id : '';
+      }
       if (v.repeat && newId) await post('ticket/update', { ticket_id: newId, repeat: v.repeat });
     }
     status(task ? 'Task saved' : 'Task added');
@@ -733,11 +742,9 @@ function timeStepper(name, hours) {
 }
 
 // Summary box that starts as "done": clicking in clears it, leaving it empty puts "done" back
+// Summary box: empty with a "done" placeholder. Left blank, it saves as "done"; anything typed saves as typed.
 function doneBox() {
-  const box = el('textarea', { name: 'what_was_done', rows: 4, required: true }, 'done');
-  box.addEventListener('focus', () => { if (box.value.trim() === 'done') box.value = ''; });
-  box.addEventListener('blur', () => { if (!box.value.trim()) box.value = 'done'; });
-  return box;
+  return el('textarea', { name: 'what_was_done', rows: 4, placeholder: 'done' });
 }
 const openDescendants = (t) => subtasksOf(t).flatMap((k) => [...openDescendants(k), k]);
 function openComplete(t) {
@@ -750,11 +757,12 @@ function openComplete(t) {
     el('p', { class: 'form-sub' }, `${t.ticket_id} ${t.task}`),
     repeats ? el('p', { class: 'form-warn' }, `This repeats ${t.repeat.toLowerCase()}. Checking it off saves this check-in to the Log and moves it to ${shortDate(nextDue(t))}.`) : null,
     kids.length ? el('p', { class: 'form-warn' }, `This also checks off its ${plural(kids.length, 'open subtask')} (${kids.map((k) => k.ticket_id).join(', ')}) with the note "Done with ${t.ticket_id}" and 0 min.`) : null,
-    field('Summary or findings', doneBox(), 'Leave it as "done" or click in to write your own'),
+    field('Summary or findings', doneBox(), 'Leave blank to save it as "done"'),
     el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Estimated time spent on task'), timeStepper('actual_hours', repeats ? undefined : t.actual_hours)),
   ], async (v) => {
     const sid = live ? { session_id: live.session_id } : {};
     for (const k of kids) await post('ticket/update', { ticket_id: k.ticket_id, complete: { what_was_done: `Done with ${t.ticket_id}`, actual_hours: 0, ...sid } });
+    if (!String(v.what_was_done || '').trim()) v.what_was_done = 'done';
     const out = await post('ticket/update', { ticket_id: t.ticket_id, complete: { ...v, ...sid } });
     status(out.reopened ? `Logged. Next one is due ${shortDate(out.reopened)}` : 'Checked off and saved to the log');
   }, 'Check off', lastSub ? () => openParentPrompt(parent.ticket_id) : null);
@@ -1114,7 +1122,8 @@ function openEndSession(s, isReview = false) {
 const isoOf = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 const parseIso = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s); return m ? new Date(+m[1], m[2] - 1, +m[3]) : null; };
 const addDays = (iso, n) => { const d = parseIso(iso); d.setDate(d.getDate() + n); return isoOf(d); };
-const mondayOf = (iso) => { const d = parseIso(iso); const back = (d.getDay() + 6) % 7; d.setDate(d.getDate() - back); return isoOf(d); };
+// Weeks run Sunday to Saturday to match the Gusto timecard week
+const mondayOf = (iso) => { const d = parseIso(iso); d.setDate(d.getDate() - d.getDay()); return isoOf(d); };
 const shortDate = (iso) => { const d = parseIso(iso); return d ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : iso; };
 // completed_at can come back as "2026-11-21 13:05" or "11/21/2026 13:05"
 const logDay = (l) => { const v = String(l.completed_at || ''); return toIso(v.slice(0, 10)) || toIso(v.split(' ')[0]) || ''; };
@@ -1122,7 +1131,7 @@ const logDay = (l) => { const v = String(l.completed_at || ''); return toIso(v.s
 function weekSettings(ws) {
   const row = (state.data.weeks || []).find((w) => String(w.week_start).slice(0, 10) === ws || toIso(String(w.week_start)) === ws);
   const cap = row && row.capacity_hours !== '' ? Number(row.capacity_hours) : 40;
-  const frozen = row && row.frozen_hours !== '' ? Number(row.frozen_hours) : (ws < FULL_TIME_START ? DEFAULT_FROZEN : 0);
+  const frozen = row && row.frozen_hours !== '' ? Number(row.frozen_hours) : (addDays(ws, 6) < FULL_TIME_START ? DEFAULT_FROZEN : 0);
   return { capacity: cap, frozen, notes: row ? row.notes : '', saved: !!row };
 }
 
@@ -1267,9 +1276,8 @@ function renderHours() {
         el('div', { class: 'log-head' },
           el('strong', {}, `${shortDate(s.date)}, ${clock(s.start)} to ${clock(s.end)}`),
           el('span', {}, [`${s.hours} h`, s.status === 'Needs review' ? 'Needs review' : ''].filter(Boolean).join(', '))),
-        s.timesheet_line ? el('p', { class: 'sheet-line' }, s.timesheet_line) : null,
         el('div', { class: 'card-actions' },
-          s.timesheet_line ? copyButton(() => s.timesheet_line, 'Copy timesheet line') : null,
+          s.timesheet_line ? copyButton(() => s.timesheet_line, 'Copy snippet') : null,
           el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit'))))) : el('p', { class: 'meter-empty' }, 'No finished sessions this week.')),
   );
 }
@@ -1295,6 +1303,39 @@ function nextDue(t) {
     else d.setDate(d.getDate() + (t.repeat === 'Every 2 weeks' ? 14 : 7));
   } while (d <= today);
   return isoOf(d);
+}
+
+// ---------- week at a glance (top of the dashboard) ----------
+function renderWeekStrip(view) {
+  const box = $('week-strip');
+  box.hidden = view !== 'home';
+  if (box.hidden) return;
+  const ws = mondayOf(todayIso());
+  const set = weekSettings(ws);
+  const available = Math.max(0, set.capacity - set.frozen);
+  const w = weekData(ws);
+  const live = liveSession();
+  const sessHours = round2(w.sessions.reduce((t, s) => t + (Number(s.hours) || 0), 0) + (live ? sessionMinutes(live) / 60 : 0));
+  const worked = round2(Math.max(w.total, sessHours));
+  // How far through the week we are, by the clock (Sunday 00:00 to Saturday 24:00)
+  const start = parseIso(ws);
+  const through = Math.min(1, Math.max(0, (Date.now() - start.getTime()) / (7 * 864e5)));
+  const pct = available ? Math.min(100, (worked / available) * 100) : 0;
+  box.replaceChildren(el('a', { class: 'week-card', href: '#hours', style: 'text-decoration: none; color: inherit' },
+    el('div', {}, el('h2', {}, 'This week'), el('span', { class: 'week-sub' }, `${shortDate(ws)} to ${shortDate(addDays(ws, 6))}`)),
+    el('div', { class: 'pace-wrap' },
+      el('div', { class: 'pace', role: 'img', 'aria-label': `${worked} of ${available} hours, ${Math.round(through * 100)}% through the week` },
+        el('div', { class: 'pace-fill', style: `width: calc(${pct}% - 6px)` }),
+        el('div', { class: 'pace-mark', style: `left: ${through * 100}%`, 'data-label': `On pace: ${round2(available * through)} h` }))),
+    el('div', { class: 'week-num' }, `${worked}`, el('small', {}, `of ${available} h`))));
+}
+
+function sessionList(list) {
+  return el('ul', { class: 'sess-list' }, list.map((s) => el('li', {},
+    el('strong', {}, `${shortDate(s.date)}`),
+    el('span', { class: 'muted grow' }, `${clock(s.start)} to ${clock(s.end)}, ${s.hours || 0} h${s.status === 'Needs review' ? ', needs review' : ''}`),
+    s.timesheet_line ? copyButton(() => s.timesheet_line, 'Copy snippet') : null,
+    el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit'))));
 }
 
 // ---------- events ----------
