@@ -129,7 +129,24 @@ function repeatState(t) {
   if (due === addDays(today, 1)) return { show: true, priority: 'Medium' };
   return { show: false, priority: 'Low' };
 }
-const effPriority = (t) => (repeatState(t) || {}).priority || t.priority || 'Low';
+// Tasks with a due date (not repeating) climb too, but never drop below what was set:
+// Medium from 3 days out, High from the day before through the due date and after
+function dueBump(t) {
+  const due = toIso(t.due_date);
+  if (!due) return null;
+  const today = todayIso();
+  if (due <= addDays(today, 1)) return 'High';
+  if (due <= addDays(today, 3)) return 'Medium';
+  return null;
+}
+const PRI_ORDER = { High: 0, Medium: 1, Low: 2 };
+function effPriority(t) {
+  const rep = repeatState(t);
+  if (rep) return rep.priority;
+  const set = t.priority || 'Low';
+  const bump = dueBump(t);
+  return bump && PRI_ORDER[bump] < PRI_ORDER[set] ? bump : set;
+}
 const topRank = (a, b) => Math.min(PRIORITY_RANK[a] ?? 2, PRIORITY_RANK[b] ?? 2);
 const RANK_NAME = ['High', 'Medium', 'Low'];
 function upNext() {
@@ -157,7 +174,7 @@ function upNext() {
         || tasksOfProject(b.project).length - tasksOfProject(a.project).length
         || idNum(a.ticket_id) - idNum(b.ticket_id);
     })
-    .slice(0, UP_NEXT_COUNT);
+    .slice(0, 10);
 }
 
 // ---------- load ----------
@@ -193,6 +210,7 @@ const layoutMode = (view) => (view === 'project' ? state.projLayout : state.layo
 function setLayout(mode) {
   if (route().view === 'project') state.projLayout = mode; else state.layout = mode;
   applyLayout(route().view);
+  if (state.data) renderNext();
 }
 function applyLayout(view) {
   const app = $('app');
@@ -274,11 +292,19 @@ function taskRow(t, opts = {}) {
   return li;
 }
 
+// Top 5 normally; top 10 when Up next is widened or "Show top 10" is open
 function renderNext() {
-  const items = upNext();
+  const all = upNext();
+  const wide = layoutMode(route().view) === 'next';
+  const count = wide || state.nextMore ? 10 : UP_NEXT_COUNT;
+  const items = all.slice(0, count);
+  const more = !wide && all.length > UP_NEXT_COUNT
+    ? el('li', { class: 'next-more' }, el('button', { type: 'button', class: 'link', onclick: () => { state.nextMore = !state.nextMore; renderNext(); } },
+      state.nextMore ? 'Show top 5' : `Show top ${Math.min(10, all.length)}`))
+    : null;
   $('next-list').replaceChildren(...(items.length
     ? items.map((t) => taskRow(t, { showProject: true, markSub: true }))
-    : [el('li', { class: 'next-empty' }, 'Nothing is assigned to you right now. Use New task to add one.')]));
+    : [el('li', { class: 'next-empty' }, 'Nothing is assigned to you right now. Use New task to add one.')]), ...(more ? [more] : []));
 }
 
 // ---------- dashboard ----------
@@ -931,6 +957,13 @@ function clock(t) {
 }
 const fmtMins = (mins) => { const h = Math.floor(mins / 60); const m = Math.round(mins % 60); return [h ? `${h} h` : '', m || !h ? `${m} min` : ''].filter(Boolean).join(' '); };
 const round2 = (n) => Math.round(n * 100) / 100;
+function roundHalfHour(t) {
+  const m = hmToMin(t);
+  if (m === null) return t || '';
+  const h = Math.floor(m / 60); const mm = m % 60;
+  const out = mm <= 15 ? h * 60 : mm <= 44 ? h * 60 + 30 : (h + 1) * 60;
+  return `${pad2(Math.floor(out / 60) % 24)}:${pad2(out % 60)}`;
+}
 // "yyyy-MM-dd HH:mm" (how the webhooks stamp times) as a local Date
 const stampDate = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(String(s || '')); return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5]) : null; };
 
@@ -1053,8 +1086,9 @@ function openEndSession(s, isReview = false) {
   const live = !isReview && (s.status === 'Open' || s.status === 'Paused');
   const pausedExtra = s.status === 'Paused' && stampDate(s.paused_at) ? Math.round((new Date() - stampDate(s.paused_at)) / 60000) : 0;
 
-  const startIn = el('input', { name: 'start', type: 'time', value: s.start || '' });
-  const endIn = el('input', { name: 'end', type: 'time', value: live ? nowHM() : (s.end || nowHM()) });
+  // A live session's times are rounded to the half hour; edit them freely before saving
+  const startIn = el('input', { name: 'start', type: 'time', value: live ? roundHalfHour(s.start) : (s.start || '') });
+  const endIn = el('input', { name: 'end', type: 'time', value: live ? roundHalfHour(nowHM()) : (s.end || roundHalfHour(nowHM())) });
   const brkIn = el('input', { name: 'break_minutes', type: 'number', min: 0, step: 5, value: (Number(s.break_minutes) || 0) + pausedExtra });
   const hoursIn = el('input', { name: 'hours', type: 'number', min: 0, step: 0.05, value: '' });
   let hoursTouched = isReview && s.hours !== '' && s.hours !== undefined;
@@ -1115,7 +1149,7 @@ function openEndSession(s, isReview = false) {
     const a = hmToMin(startIn.value); const b = hmToMin(endIn.value);
     if (a === null || b === null) return '';
     let span = b - a; if (span < 0) span += 1440;
-    return round2(Math.max(0, span - (Number(brkIn.value) || 0)) / 60);
+    return Math.round(Math.max(0, span - (Number(brkIn.value) || 0)) / 15) / 4; // nearest quarter hour
   };
   function updateTotal() {
     if (!hoursTouched) hoursIn.value = autoHours();
@@ -1135,6 +1169,7 @@ function openEndSession(s, isReview = false) {
     el('div', { class: 'row' },
       field('Date', el('input', { name: 'date', type: 'date', value: s.date || todayIso() })),
       field('Start', startIn), field('End', endIn)),
+    live ? el('p', { class: 'field-hint' }, 'Start and end are rounded to the half hour (:00 to :15 rounds down, :16 to :44 goes to :30, :45 and up rounds up)') : null,
     el('div', { class: 'row' },
       field('Break minutes', brkIn),
       field('Session hours', hoursIn, 'Fills in from the times. Type to override')),

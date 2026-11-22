@@ -94,7 +94,7 @@ button { cursor: pointer; }
   .layout.mode-next > .view { display: none; }
   .mode-next #strip-right { display: flex; }
   .mode-next .next { position: static; }
-  .mode-next .next-list { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+  .mode-next .next-list { max-width: 900px; }
 
   .strip {
     writing-mode: vertical-rl; transform: rotate(180deg);
@@ -482,3 +482,5 @@ a.link { text-decoration: none; }
 .session-group > .log-head strong { font-family: var(--font-head); font-weight: 500; font-size: 17px; }
 .log-list.nested { margin-top: 10px; gap: 8px; }
 .log-list.nested .log-item { background: var(--paper); }
+
+.next-more { list-style: none; padding: 4px 2px 0; }
