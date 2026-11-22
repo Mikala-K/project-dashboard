@@ -650,10 +650,12 @@ function sessionGroup(s, entries, isLive) {
   const projects = [...new Set(entries.map((l) => l.project).filter(Boolean))];
   const hours = isLive ? round2(sessionMinutes(s) / 60) : (s.hours || 0);
   const when = isLive ? `In progress since ${clock(s.start)}${s.status === 'Paused' ? ' (paused)' : ''}` : `${clock(s.start)} to ${clock(s.end)}`;
-  return el('li', { class: `session-group${isLive ? ' live' : ''}` },
-    el('div', { class: 'log-head' },
-      el('strong', {}, `Session, ${shortDate(s.date)}`),
-      el('span', {}, [when, `${hours} h`, s.status === 'Needs review' ? 'needs review' : ''].filter(Boolean).join(', '))),
+  // Collapsed by default; remembers which ones you opened until the page reloads
+  state.openSessions = state.openSessions || new Set();
+  const box = el('details', { class: `session-group${isLive ? ' live' : ''}`, open: state.openSessions.has(s.session_id) || null },
+    el('summary', { class: 'log-head' },
+      el('strong', {}, `Session, ${parseIso(s.date) ? parseIso(s.date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) : s.date}`),
+      el('span', {}, [when, `${hours} h`, plural(entries.length, 'entry'), s.status === 'Needs review' ? 'needs review' : ''].filter(Boolean).join(', '))),
     projects.length ? el('div', { class: 'type-chips' }, projects.map((p) => el('span', { class: 'type-chip' }, projectName(p)))) : null,
     el('div', { class: 'card-actions' },
       s.timesheet_line ? copyButton(() => s.timesheet_line, 'Copy snippet') : null,
@@ -661,6 +663,8 @@ function sessionGroup(s, entries, isLive) {
         : el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit')),
     entries.length ? el('ol', { class: 'log-list nested' }, entries.map((l) => logItem(l, false)))
       : el('p', { class: 'meter-empty' }, 'Nothing checked off in this session yet.'));
+  box.addEventListener('toggle', () => { if (box.open) state.openSessions.add(s.session_id); else state.openSessions.delete(s.session_id); });
+  return el('li', {}, box);
 }
 function renderLog() {
   const d = state.data;
@@ -686,7 +690,16 @@ function renderLog() {
     items.push({ at: stampOf(l.completed_at), node: logItem(l, true) });
   }
   items.sort((a, b) => b.at.localeCompare(a.at));
-  $('log-list').replaceChildren(items.length ? el('ol', { class: 'log-list' }, items.map((i) => i.node))
+  // Week headings (Sunday to Saturday) keep the long scroll easy to skim
+  const withWeeks = [];
+  let lastWeek = '';
+  for (const i of items) {
+    const day = i.at === '9999' ? todayIso() : i.at.slice(0, 10);
+    const wk = toIso(day) ? mondayOf(day) : '';
+    if (wk && wk !== lastWeek) { withWeeks.push(el('li', { class: 'week-head' }, `Week of ${shortDate(wk)}`)); lastWeek = wk; }
+    withWeeks.push(i.node);
+  }
+  $('log-list').replaceChildren(items.length ? el('ol', { class: 'log-list' }, withWeeks)
     : el('p', { class: 'meter-empty' }, 'Checked-off tasks and sessions show up here, newest first.'));
 }
 
@@ -810,11 +823,13 @@ function timeStepper(name, hours) {
   const down = () => { mins = mins <= 15 ? Math.max(0, mins - 5) : Math.ceil(mins / 15) * 15 - 15; show(); };
   const up = () => { mins = mins < 15 ? mins + 5 : Math.floor(mins / 15) * 15 + 15; show(); };
   show();
-  return el('div', { class: 'stepper' },
+  const wrap = el('div', { class: 'stepper' },
     el('button', { type: 'button', class: 'step-btn', 'aria-label': 'Less time', onclick: down }, '−'),
     label,
     el('button', { type: 'button', class: 'step-btn', 'aria-label': 'More time', onclick: up }, '+'),
     hidden);
+  wrap.setMinutes = (m) => { mins = Math.max(0, Math.round(m)); show(); };
+  return wrap;
 }
 
 // Summary box that starts as "done": clicking in clears it, leaving it empty puts "done" back
@@ -1064,25 +1079,36 @@ function buildRecap(items) {
   return [...byProject].map(([p, list]) => `${p ? projectName(p) : 'No project'}: ${list.join(', ')}`).join('\n');
 }
 function buildTimesheet(items) {
+  // One short line, like "ICONO-LABS - field list, export mapping, Claude connection, and a bit of Project Dashboard work"
+  const real = items.filter((it) => it.task && !/^misc\b/i.test(it.task));
+  if (!real.length) return '';
   const byClient = new Map();
-  for (const it of items) {
-    if (!it.task) continue;
-    const k = it.project ? clientCode(it.project) : 'WIPP';
-    if (!byClient.has(k)) byClient.set(k, []);
-    const name = it.task.replace(/[.]+$/, '');
-    if (!byClient.get(k).includes(name)) byClient.get(k).push(name);
+  for (const it of real) {
+    const c = it.project ? clientCode(it.project) : 'WIPP';
+    if (!byClient.has(c)) byClient.set(c, []);
+    byClient.get(c).push(it);
   }
-  return [...byClient].map(([c, list]) => `${c} - ${list.join(', ')}`).join('; ').replace(/\./g, '');
+  const total = (list) => list.reduce((t, x) => t + (x.hours || 0), 0);
+  const ranked = [...byClient].sort((a, b) => total(b[1]) - total(a[1]) || b[1].length - a[1].length);
+  const [main, mainItems] = ranked[0];
+  const names = [...mainItems].sort((a, b) => (b.hours || 0) - (a.hours || 0)).slice(0, 4)
+    .map((x) => x.task.replace(/[.]+$/, '').replace(/\s*\(.*?\)\s*/g, ' ').trim());
+  const others = [...new Set(ranked.slice(1).flatMap(([, list]) => list.map((x) => (projectOf(x.project) || {}).project || 'other')))];
+  const tail = others.length ? `, and a bit of ${others.slice(0, 2).join(' and ')} work` : '';
+  return `${main} - ${names.join(', ')}${tail}`.replace(/\./g, '');
 }
 
 function openEndSession(s, isReview = false) {
   const d = state.data;
   const entries = sessionLog(s);
+  const isMisc = (l) => /^misc\b/i.test(String(l.task || ''));
   const tasks = entries.filter((l) => l.source !== 'Extra' && l.source !== 'Calendar');
-  const extras = entries.filter((l) => l.source === 'Extra' || l.source === 'Calendar');
+  const extras = entries.filter((l) => (l.source === 'Extra' || l.source === 'Calendar') && !isMisc(l));
+  const miscOld = entries.find((l) => l.source === 'Extra' && isMisc(l));
   const removed = [];
   const projOpts = [['', 'Choose a project'], ...sortProjects([...d.projects].filter((p) => !CLOSED.includes(p.status))).map((p) => [p.project_id, p.display_name])];
-  const typeOpts = [['', 'Project default'], ...TIME_TYPES.map((x) => [x, x])];
+  // "Project default" says which type that is, e.g. Project default (Personal)
+  const typeOptsFor = (pid) => [['', `Project default (${(projectOf(pid) || {}).time_type || 'Billable'})`], ...TIME_TYPES.map((x) => [x, x])];
   const live = !isReview && (s.status === 'Open' || s.status === 'Paused');
   const pausedExtra = s.status === 'Paused' && stampDate(s.paused_at) ? Math.round((new Date() - stampDate(s.paused_at)) / 60000) : 0;
 
@@ -1090,42 +1116,52 @@ function openEndSession(s, isReview = false) {
   const startIn = el('input', { name: 'start', type: 'time', value: live ? roundHalfHour(s.start) : (s.start || '') });
   const endIn = el('input', { name: 'end', type: 'time', value: live ? roundHalfHour(nowHM()) : (s.end || roundHalfHour(nowHM())) });
   const brkIn = el('input', { name: 'break_minutes', type: 'number', min: 0, step: 5, value: (Number(s.break_minutes) || 0) + pausedExtra });
-  const hoursIn = el('input', { name: 'hours', type: 'number', min: 0, step: 0.05, value: '' });
-  let hoursTouched = isReview && s.hours !== '' && s.hours !== undefined;
-  if (hoursTouched) hoursIn.value = s.hours;
-  const totalLine = el('p', { class: 'field-hint session-total' });
+  const summary = el('div', { class: 'end-summary', 'aria-live': 'polite' });
+  const warn = el('p', { class: 'form-warn', hidden: true });
 
   const taskRows = el('div', { class: 'end-rows' }, tasks.length ? tasks.map((l) => el('div', { class: 'end-row', 'data-log': l.log_id },
     el('div', { class: 'end-row-head' }, el('strong', {}, `${l.ticket_id} ${l.task}`), el('span', {}, projectName(l.project))),
     el('textarea', { 'data-k': 'what_was_done', rows: 2, 'aria-label': `Summary for ${l.ticket_id}` }, l.what_was_done || ''),
     el('div', { class: 'row' },
       el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Time'), timeStepper(`t_${l.log_id}`, l.actual_hours === '' ? 0 : l.actual_hours)),
-      field('Time type', select(`tt_${l.log_id}`, typeOpts, l.time_type || ''))),
+      field('Time type', select(`tt_${l.log_id}`, typeOptsFor(l.project), l.time_type || ''))),
   )) : [el('p', { class: 'meter-empty' }, 'No tasks checked off during this session yet.')]);
 
-  const extraRows = el('div', { class: 'end-rows' });
-  const addExtra = (x = {}) => {
-    const row = el('div', { class: 'end-row extra', 'data-log': x.log_id || '' },
+  const extraRow = (x = {}, misc = false) => {
+    const projSel = select('', projOpts, x.project || 'P-007');
+    const typeSel = select('', typeOptsFor(x.project || 'P-007'), x.time_type || '');
+    projSel.setAttribute('data-k', 'project');
+    typeSel.setAttribute('data-k', 'time_type');
+    projSel.addEventListener('change', () => { typeSel.options[0].textContent = typeOptsFor(projSel.value)[0][1]; });
+    const stepper = timeStepper(`x_${Math.random().toString(36).slice(2)}`, x.actual_hours === undefined || x.actual_hours === '' ? (misc ? 0 : 0.5) : x.actual_hours);
+    const row = el('div', { class: `end-row extra${misc ? ' misc' : ''}`, 'data-log': x.log_id || '' },
       el('div', { class: 'row' },
-        field('What was it', el('input', { 'data-k': 'task', value: x.task || '', placeholder: 'Client call, training video…' })),
-        field('Project', select('', projOpts, x.project || 'P-007'))),
+        field(misc ? 'Misc' : 'What was it', el('input', { 'data-k': 'task', value: x.task || (misc ? 'Misc' : ''), placeholder: 'Client call, training video…' })),
+        field('Project', projSel)),
       el('div', { class: 'row' },
-        el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Time'), timeStepper(`x_${Math.random().toString(36).slice(2)}`, x.actual_hours === undefined || x.actual_hours === '' ? 0.5 : x.actual_hours)),
-        field('Time type', select('', typeOpts, x.time_type || ''))),
-      field('Note', el('input', { 'data-k': 'note', value: x.what_was_done || '' })),
+        el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Time'), stepper),
+        field('Time type', typeSel)),
+      field('Note', el('input', { 'data-k': 'note', value: x.what_was_done || '',
+        placeholder: misc ? 'Calls, meetings, work-related study, emails, etc. Anything that was not an explicit task' : '' })),
       x.source === 'Calendar' ? el('p', { class: 'field-hint' }, 'From your calendar') : null,
-      el('button', { type: 'button', class: 'link remove', onclick: () => { if (x.log_id) removed.push(x.log_id); row.remove(); updateTotal(); } }, 'Remove'));
-    row.querySelectorAll('select')[0].setAttribute('data-k', 'project');
-    row.querySelectorAll('select')[1].setAttribute('data-k', 'time_type');
-    row.addEventListener('click', () => setTimeout(updateTotal, 0));
-    extraRows.append(row);
+      misc ? el('p', { class: 'field-hint misc-hint' }) : el('button', { type: 'button', class: 'link remove', onclick: () => { if (x.log_id) removed.push(x.log_id); row.remove(); update(); } }, 'Remove'));
+    return row;
   };
-  extras.forEach(addExtra);
+  const extraRows = el('div', { class: 'end-rows' }, extras.map((x) => extraRow(x)));
+
+  // Misc soaks up whatever the tasks and extras don't cover, until you change it yourself
+  const taskMinsByProject = {};
+  tasks.forEach((l) => { taskMinsByProject[l.project] = (taskMinsByProject[l.project] || 0) + (Number(l.actual_hours) || 0); });
+  const topProject = Object.keys(taskMinsByProject).sort((a, b) => taskMinsByProject[b] - taskMinsByProject[a])[0] || 'P-007';
+  const miscRow = extraRow(miscOld || { project: topProject }, true);
+  const miscStepper = miscRow.querySelector('.stepper');
+  let miscTouched = !!miscOld;
+  miscStepper.addEventListener('click', (e) => { if (e.target.closest('button')) { miscTouched = true; setTimeout(update, 0); } });
 
   const recapBox = el('textarea', { name: 'recap', rows: 3 }, s.recap || '');
   const sheetBox = el('textarea', { name: 'timesheet_line', rows: 2 }, s.timesheet_line || '');
 
-  // Everything in the popup as {task, project, hours}
+  const rowMins = (r, sel) => Math.round((Number(r.querySelector(sel).value) || 0) * 60);
   const collect = () => {
     const out = [];
     taskRows.querySelectorAll('.end-row').forEach((r) => {
@@ -1135,8 +1171,8 @@ function openEndSession(s, isReview = false) {
         hours: Number(r.querySelector(`[name="t_${l.log_id}"]`).value) || 0,
         time_type: r.querySelector(`[name="tt_${l.log_id}"]`).value });
     });
-    extraRows.querySelectorAll('.end-row').forEach((r) => {
-      out.push({ log_id: r.dataset.log || undefined, kind: 'extra',
+    [...extraRows.querySelectorAll('.end-row'), miscRow].forEach((r) => {
+      out.push({ log_id: r.dataset.log || undefined, kind: r === miscRow ? 'misc' : 'extra',
         task: r.querySelector('[data-k="task"]').value.trim(),
         project: r.querySelector('[data-k="project"]').value,
         hours: Number(r.querySelector('.stepper input[type="hidden"]').value) || 0,
@@ -1145,53 +1181,79 @@ function openEndSession(s, isReview = false) {
     });
     return out;
   };
-  const autoHours = () => {
+  const durationMins = () => {
     const a = hmToMin(startIn.value); const b = hmToMin(endIn.value);
-    if (a === null || b === null) return '';
+    if (a === null || b === null) return 0;
     let span = b - a; if (span < 0) span += 1440;
-    return Math.round(Math.max(0, span - (Number(brkIn.value) || 0)) / 15) / 4; // nearest quarter hour
+    return span;
   };
-  function updateTotal() {
-    if (!hoursTouched) hoursIn.value = autoHours();
-    const sum = round2(collect().reduce((t, x) => t + x.hours, 0));
-    totalLine.textContent = `Tasks and extras add up to ${sum} h. Session is ${hoursIn.value || 0} h.`;
+  const fmtH = (mins) => `${round2(mins / 60)} h`;
+  let worked = 0;
+  function update() {
+    const dur = durationMins();
+    const brk = Number(brkIn.value) || 0;
+    const items = collect();
+    const taskM = Math.round(items.filter((x) => x.kind === 'task').reduce((t, x) => t + x.hours * 60, 0));
+    const extraM = Math.round(items.filter((x) => x.kind === 'extra').reduce((t, x) => t + x.hours * 60, 0));
+    if (!miscTouched) miscStepper.setMinutes(Math.max(0, Math.round((dur - brk - taskM - extraM) / 5) * 5));
+    const miscM = rowMins(miscRow, '.stepper input[type="hidden"]');
+    worked = taskM + extraM + miscM;
+    const gap = dur - brk - worked;
+    summary.replaceChildren(
+      el('div', {}, el('span', {}, 'Session'), el('strong', {}, fmtH(dur))),
+      el('div', {}, el('span', {}, 'Tasks'), el('strong', {}, fmtH(taskM))),
+      el('div', {}, el('span', {}, 'Extras'), el('strong', {}, fmtH(extraM))),
+      el('div', {}, el('span', {}, 'Misc'), el('strong', {}, fmtH(miscM))),
+      el('div', {}, el('span', {}, 'Break'), el('strong', {}, fmtMins(brk))),
+      el('div', { class: 'worked' }, el('span', {}, 'Hours worked'), el('strong', {}, fmtH(worked))));
+    warn.hidden = Math.abs(gap) < 3;
+    warn.textContent = gap < 0
+      ? `Session task time exceeds session duration by ${fmtMins(-gap)}. Trim task times, misc or break.`
+      : `${fmtMins(gap)} of the session isn't accounted for. Add it to misc or a task.`;
+    miscRow.querySelector('.misc-hint').textContent = miscTouched
+      ? 'You set this one. It no longer fills in on its own.'
+      : 'Fills in on its own: session minus break, tasks and extras';
   }
   const rebuild = () => {
-    const items = collect();
+    const items = collect().filter((x) => x.kind !== 'misc');
     recapBox.value = buildRecap(items);
     sheetBox.value = buildTimesheet(items);
   };
-  [startIn, endIn, brkIn].forEach((i) => i.addEventListener('input', updateTotal));
-  hoursIn.addEventListener('input', () => { hoursTouched = hoursIn.value !== ''; updateTotal(); });
-  taskRows.addEventListener('click', () => setTimeout(updateTotal, 0));
+  [startIn, endIn, brkIn].forEach((i) => i.addEventListener('input', update));
+  taskRows.addEventListener('click', () => setTimeout(update, 0));
+  extraRows.addEventListener('click', () => setTimeout(update, 0));
 
-  showDialog(isReview ? `Review session ${s.date}` : 'End session', [
+  showDialog(isReview ? `Review session ${shortDate(s.date)}` : 'End session', [
     el('div', { class: 'row' },
       field('Date', el('input', { name: 'date', type: 'date', value: s.date || todayIso() })),
       field('Start', startIn), field('End', endIn)),
-    live ? el('p', { class: 'field-hint' }, 'Start and end are rounded to the half hour (:00 to :15 rounds down, :16 to :44 goes to :30, :45 and up rounds up)') : null,
-    el('div', { class: 'row' },
-      field('Break minutes', brkIn),
-      field('Session hours', hoursIn, 'Fills in from the times. Type to override')),
-    totalLine,
+    live ? el('p', { class: 'field-hint' }, 'Start and end times are rounded to the half hour') : null,
+    field('Break minutes', brkIn),
+    summary,
+    warn,
     el('h3', { class: 'end-title' }, 'Tasks checked off'),
     taskRows,
     el('div', { class: 'end-title-row' }, el('h3', { class: 'end-title' }, 'Extras'),
-      el('button', { type: 'button', class: 'link', onclick: () => { addExtra(); updateTotal(); } }, 'Add an extra')),
+      el('button', { type: 'button', class: 'link', onclick: () => { extraRows.append(extraRow()); update(); } }, 'Add an extra')),
     el('p', { class: 'field-hint' }, 'Calls, meetings, videos or anything that was not a task'),
     extraRows,
+    miscRow,
     el('div', { class: 'end-title-row' }, el('h3', { class: 'end-title' }, 'Recap'),
       el('button', { type: 'button', class: 'link', onclick: rebuild }, 'Rebuild from tasks and extras')),
     field('By project', recapBox),
-    field('Timesheet line for Gusto', sheetBox, 'Copied when you save'),
+    field('Timesheet line for Gusto', sheetBox, 'One short line. Copied when you save'),
   ], async (v, form, submitter) => {
     const items = collect();
     const review = submitter && submitter.value === 'review';
+    const misc = items.find((x) => x.kind === 'misc');
+    const keepMisc = misc && misc.task && misc.hours > 0;
+    if (!keepMisc && miscOld) removed.push(miscOld.log_id);
     await post('session', {
       action: 'end', session_id: s.session_id, date: v.date, start: v.start, end: v.end,
-      break_minutes: v.break_minutes, hours: hoursTouched ? v.hours : '',
+      break_minutes: v.break_minutes, hours: round2(worked / 60),
       tasks: items.filter((x) => x.kind === 'task').map((x) => ({ log_id: x.log_id, actual_hours: x.hours, what_was_done: x.what_was_done, time_type: x.time_type })),
-      extras: items.filter((x) => x.kind === 'extra' && x.task).map((x) => ({ log_id: x.log_id, task: x.task, project: x.project, hours: x.hours, time_type: x.time_type, note: x.note })),
+      extras: items.filter((x) => (x.kind === 'extra' && x.task) || (x.kind === 'misc' && keepMisc))
+        .map((x) => ({ log_id: x.log_id, task: x.task, project: x.project, hours: x.hours, time_type: x.time_type, note: x.note })),
       remove_log_ids: removed, recap: v.recap, timesheet_line: v.timesheet_line, review,
     });
     try { await navigator.clipboard.writeText(v.timesheet_line); } catch (e) { /* clipboard blocked */ }
@@ -1200,7 +1262,7 @@ function openEndSession(s, isReview = false) {
   }, 'Save session', null, [{ label: 'Review later', value: 'review' }]);
 
   if (!recapBox.value && !sheetBox.value) rebuild();
-  updateTotal();
+  update();
 }
 
 // ---------- hours ----------

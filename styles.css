@@ -484,3 +484,19 @@ a.link { text-decoration: none; }
 .log-list.nested .log-item { background: var(--paper); }
 
 .next-more { list-style: none; padding: 4px 2px 0; }
+
+/* Log: sessions fold up */
+details.session-group > summary { cursor: pointer; list-style: none; }
+details.session-group > summary::-webkit-details-marker { display: none; }
+details.session-group > summary strong::before { content: "▸"; display: inline-block; width: 1.1em; color: var(--link); transition: transform 150ms ease; }
+details.session-group[open] > summary strong::before { transform: rotate(90deg); }
+details.session-group > .type-chips, details.session-group > .card-actions { margin-left: 1.1em; }
+.log-list > li:has(> details) { list-style: none; }
+.week-head { list-style: none; font-family: var(--font-head); font-size: 15px; color: var(--ink-soft); letter-spacing: 0.05em; text-transform: uppercase; margin: 10px 0 0; }
+/* End popup tally */
+.end-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 6px; background: var(--field); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px; }
+.end-summary div { display: grid; gap: 2px; text-align: center; }
+.end-summary span { font-size: 12px; color: var(--ink-soft); }
+.end-summary strong { font-family: var(--font-head); font-weight: 500; font-size: 18px; }
+.end-summary .worked strong { color: var(--link); }
+.end-row.misc { border-style: dashed; }
