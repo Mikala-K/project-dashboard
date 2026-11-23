@@ -758,6 +758,26 @@ function showDialog(title, formKids, onSave, saveLabel, after, extraButtons = []
 
 // Close the open dialog before opening another one (a dialog can't be opened twice)
 const swapTo = (fn) => { $('dialog').close(); fn(); };
+// Delete removes the task and its subtasks from the sheet (Log entries stay). Two clicks to confirm.
+function deleteTaskButton(t) {
+  const kids = openDescendants(t);
+  const label = kids.length ? `Delete this task and its ${plural(kids.length, 'subtask')}` : 'Delete this task';
+  const btn = el('button', { type: 'button', class: 'link remove delete-task' }, label);
+  let armed = false;
+  btn.addEventListener('click', async () => {
+    if (!armed) { armed = true; btn.textContent = `${label}? Click again to confirm`; setTimeout(() => { armed = false; btn.textContent = label; }, 4000); return; }
+    btn.disabled = true;
+    try {
+      await post('session', { action: 'ticket_delete', ticket_id: t.ticket_id });
+      $('dialog').close();
+      if (route().view === 'project' || location.hash.includes(t.ticket_id)) render();
+      await load();
+      status(`${t.ticket_id} deleted`);
+    } catch (ex) { btn.disabled = false; status(`Could not delete: ${ex.message}`); }
+  });
+  return btn;
+}
+
 function openTask({ task, project, parent }) {
   const d = state.data;
   const t = task || {};
@@ -801,6 +821,7 @@ function openTask({ task, project, parent }) {
       'Checking it off logs it and reopens it with the next due date. It stays out of Up next until the day before (Medium), then turns High on the due date'),
     field('Notes', el('textarea', { name: 'notes', rows: 2 }, t.notes || '')),
     cats,
+    task ? deleteTaskButton(t) : null,
   ], async (v) => {
     if (task) await post('ticket/update', { ticket_id: t.ticket_id, ...v });
     else {

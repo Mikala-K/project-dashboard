@@ -504,3 +504,5 @@ details.session-group > .type-chips, details.session-group > .card-actions { mar
 .pin-btn { margin-left: auto; background: none; border: 1px solid transparent; border-radius: 50%; width: 30px; height: 30px; display: grid; place-items: center; color: var(--ink-soft); padding: 0; }
 .pin-btn:hover { color: var(--link); border-color: var(--line); }
 .pin-btn.on { color: var(--link); }
+
+.delete-task { margin-top: 6px; }
