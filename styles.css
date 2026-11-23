@@ -506,3 +506,8 @@ details.session-group > .type-chips, details.session-group > .card-actions { mar
 .pin-btn.on { color: var(--link); }
 
 .delete-task { margin-top: 6px; }
+
+.person-pick { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ink-soft); }
+.person-pick select { background: var(--field); color: var(--ink); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 6px 10px; }
+.setup-notice { border-left: 4px solid var(--link); }
+.setup-notice p { margin: 4px 0 12px; color: var(--ink-soft); }

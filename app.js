@@ -304,7 +304,7 @@ function renderNext() {
     : null;
   $('next-list').replaceChildren(...(items.length
     ? items.map((t) => taskRow(t, { showProject: true, markSub: true }))
-    : [el('li', { class: 'next-empty' }, 'Nothing is assigned to you right now. Use New task to add one.')]), ...(more ? [more] : []));
+    : [el('li', { class: 'next-empty' }, 'No tasks have been assigned to you yet. Set up a new project or assign yourself a task to see your top priorities here.')]), ...(more ? [more] : []));
 }
 
 // ---------- dashboard ----------
@@ -1021,7 +1021,9 @@ function roundHalfHour(t) {
 // "yyyy-MM-dd HH:mm" (how the webhooks stamp times) as a local Date
 const stampDate = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(String(s || '')); return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5]) : null; };
 
-const mySessions = () => (state.data.sessions || []);
+// The webhook returns everyone's sessions; these are the signed-in person's
+const sessionsOf = (person) => (state.data.sessions || []).filter((s) => !s.person || s.person === person);
+const mySessions = () => sessionsOf(state.data.user.name);
 const liveSession = () => mySessions().find((s) => s.status === 'Open' || s.status === 'Paused') || null;
 const reviewSessions = () => mySessions().filter((s) => s.status === 'Needs review');
 // Log rows that belong to a session: tagged with it, or checked off after it started and not tagged yet
@@ -1314,22 +1316,35 @@ const shortDate = (iso) => { const d = parseIso(iso); return d ? d.toLocaleDateS
 // completed_at can come back as "2026-11-21 13:05" or "11/21/2026 13:05"
 const logDay = (l) => { const v = String(l.completed_at || ''); return toIso(v.slice(0, 10)) || toIso(v.split(' ')[0]) || ''; };
 
-function weekSettings(ws) {
-  const row = (state.data.weeks || []).find((w) => String(w.week_start).slice(0, 10) === ws || toIso(String(w.week_start)) === ws);
-  const cap = row && row.capacity_hours !== '' ? Number(row.capacity_hours) : 40;
-  const frozen = row && row.frozen_hours !== '' ? Number(row.frozen_hours) : (addDays(ws, 6) < FULL_TIME_START ? DEFAULT_FROZEN : 0);
-  return { capacity: cap, frozen, notes: row ? row.notes : '', saved: !!row };
+// Each person's hour settings live on their Team row: hours_target plus a plan
+// { no_cap, frozen, frozen_until, framework: [[label, min, max], ...] } with min/max for a full target week
+function hoursPlan(person) {
+  const t = (state.data.team || []).find((p) => p.name === person) || {};
+  let plan = null;
+  try { plan = t.hours_plan ? JSON.parse(t.hours_plan) : null; } catch (e) { plan = null; }
+  if (!plan) return null;
+  const fw = Array.isArray(plan.framework) && plan.framework.length ? plan.framework : FRAMEWORK.map(([l, , lo, hi]) => [l, lo, hi]);
+  return { target: Number(t.hours_target) || 40, noCap: !!plan.no_cap, frozen: Number(plan.frozen) || 0, frozenUntil: plan.frozen_until || '', framework: fw };
 }
 
-function weekData(ws) {
+function weekSettings(ws, person = state.data.user.name) {
+  const plan = hoursPlan(person);
+  const row = (state.data.weeks || []).find((w) => (String(w.week_start).slice(0, 10) === ws || toIso(String(w.week_start)) === ws) && (w.person || '') === person);
+  if (!plan) return { setUp: false, noCap: true, capacity: 0, frozen: 0, notes: row ? row.notes : '' };
+  const cap = row && row.capacity_hours !== '' ? Number(row.capacity_hours) : plan.target;
+  const frozen = row && row.frozen_hours !== '' ? Number(row.frozen_hours) : (plan.frozenUntil && addDays(ws, 6) < plan.frozenUntil ? plan.frozen : 0);
+  return { setUp: true, noCap: plan.noCap, capacity: cap, frozen, notes: row ? row.notes : '', plan };
+}
+
+function weekData(ws, person = state.data.user.name) {
   const we = addDays(ws, 7);
-  const me = state.data.user.name;
+  const me = person;
   const entries = state.data.log.filter((l) => l.completed_by === me && logDay(l) >= ws && logDay(l) < we)
     .map((l) => ({ ...l, _type: typeOf(l), _hours: Number(l.actual_hours) || 0, _day: logDay(l) }));
   const byType = Object.fromEntries(TIME_TYPES.map((t) => [t, 0]));
   for (const e of entries) byType[e._type] = round2((byType[e._type] || 0) + e._hours);
   const total = round2(entries.reduce((t, e) => t + e._hours, 0));
-  const sessions = mySessions().filter((s) => s.date >= ws && s.date < we && s.status !== 'Open' && s.status !== 'Paused');
+  const sessions = sessionsOf(person).filter((s) => s.date >= ws && s.date < we && s.status !== 'Open' && s.status !== 'Paused');
   return { entries, byType, total, sessions };
 }
 
@@ -1344,21 +1359,38 @@ function renderHours() {
   const view = $('view-hours');
   if (!state.week) state.week = mondayOf(todayIso());
   const ws = state.week;
-  const set = weekSettings(ws);
-  const available = Math.max(0, set.capacity - set.frozen);
-  const w = weekData(ws);
+  const me = state.data.user.name;
+  const person = state.hoursPerson && state.data.people.includes(state.hoursPerson) ? state.hoursPerson : me;
+  const self = person === me;
+  const set = weekSettings(ws, person);
+  const capped = set.setUp && !set.noCap;
+  const available = capped ? Math.max(0, set.capacity - set.frozen) : 0;
+  const w = weekData(ws, person);
   const left = round2(available - w.total);
-  const scale = available / 40;
+  const fullTarget = set.plan ? set.plan.target : 40;
+  const scale = capped && fullTarget ? available / fullTarget : 1;
+  const who = self ? 'You have' : `${person} has`;
 
   // Week bar: logged time by type, then what's left, then frozen hours
-  const segs = [...TIME_TYPES.map((t) => [t, w.byType[t]]), ['Left', Math.max(0, left)], ['Frozen', set.frozen]].filter(([, h]) => h > 0);
-  const barTotal = Math.max(set.capacity, w.total + set.frozen) || 1;
+  const segs = [...TIME_TYPES.map((t) => [t, w.byType[t]]), ...(capped ? [['Left', Math.max(0, left)], ['Frozen', set.frozen]] : [])].filter(([, h]) => h > 0);
+  const barTotal = capped ? (Math.max(set.capacity, w.total + set.frozen) || 1) : (w.total || 1);
   const bar = el('div', { class: 'week-bar', role: 'img', 'aria-label': `${w.total} of ${available} hours logged` },
     segs.map(([t, h]) => el('div', { class: 'week-seg', 'data-type': t, style: `flex: ${h} 1 0`, title: `${t}: ${h} h` },
       (h / barTotal) > 0.07 ? el('span', {}, `${round2(h)}`) : null)));
 
-  const framework = FRAMEWORK.map(([label, types, lo, hi, hint]) => {
+  // Framework rows come from the person's plan (same three buckets); no-cap plans compare shares of logged time
+  const planFw = set.plan ? set.plan.framework : [];
+  const framework = !set.setUp ? [] : FRAMEWORK.map(([label, types, dlo, dhi, hint]) => {
+    const own = planFw.find((f) => f[0] === label) || [label, dlo, dhi];
     const got = round2(types.reduce((t, x) => t + (w.byType[x] || 0), 0));
+    if (!capped) {
+      const share = w.total ? Math.round((got / w.total) * 100) : 0;
+      return el('div', { class: 'fw-row' },
+        el('div', { class: 'fw-head' }, el('strong', {}, label), el('span', {}, `${got} h, ${share}% of logged time`)),
+        el('div', { class: 'fw-track' }, el('div', { class: 'fw-fill', 'data-type': types[0], style: `width: ${share}%` })),
+        el('p', { class: 'field-hint' }, hint));
+    }
+    const lo = Number(own[1]) || 0; const hi = Number(own[2]) || 0;
     const min = round2(lo * scale); const max = round2(hi * scale);
     const note = got < min ? `${round2(min - got)} h under` : got > max ? `${round2(got - max)} h over` : 'In range';
     const top = Math.max(max * 1.25, got, 1);
@@ -1423,31 +1455,42 @@ function renderHours() {
 
   const noTime = w.entries.filter((e) => !e._hours).length;
 
-  view.replaceChildren(
+  const picker = state.data.people.length > 1 ? el('label', { class: 'person-pick' }, el('span', {}, 'View hours for'),
+    el('select', { onchange: (e) => { state.hoursPerson = e.target.value; render(); } },
+      state.data.people.map((n) => el('option', { value: n, selected: n === person }, n === me ? `${n} (you)` : n)))) : null;
+  const notice = !set.setUp ? el('div', { class: 'panel setup-notice' },
+    el('h3', {}, `${who} not set up hour allocation preferences yet`),
+    el('p', {}, `Hours still show up here from the Log, tied to the tasks ${self ? 'you complete' : `${person} completes`} and any sessions.`),
+    self ? el('button', { type: 'button', class: 'top-btn solid', onclick: () => openHoursSetup() }, 'Set up my hours') : null) : null;
+
+  view.replaceChildren(...[
     el('div', { class: 'projects-head' },
       el('h2', { id: 'hours-title' }, 'Hours'),
+      picker,
       el('div', { class: 'week-nav' },
         el('button', { type: 'button', class: 'secondary nav-btn', 'aria-label': 'Previous week', onclick: () => { state.week = addDays(ws, -7); render(); } }, '‹'),
         el('strong', {}, `Week of ${shortDate(ws)} to ${shortDate(addDays(ws, 6))}`),
         el('button', { type: 'button', class: 'secondary nav-btn', 'aria-label': 'Next week', onclick: () => { state.week = addDays(ws, 7); render(); } }, '›'),
         ws !== mondayOf(todayIso()) ? el('button', { type: 'button', class: 'link', onclick: () => { state.week = mondayOf(todayIso()); render(); } }, 'This week') : null)),
+    notice,
     el('div', { class: 'tiles' },
-      el('div', { class: 'tile' }, el('span', {}, 'Logged'), el('strong', {}, `${w.total} h`), el('span', {}, `of ${available} h available`)),
-      el('div', { class: 'tile' }, el('span', {}, left >= 0 ? 'Left' : 'Over'), el('strong', {}, `${Math.abs(left)} h`), el('span', {}, 'this week')),
-      el('div', { class: 'tile' }, el('span', {}, 'Frozen'), el('strong', {}, `${set.frozen} h`), el('span', {}, set.frozen ? `of ${set.capacity} h` : 'none this week')),
+      el('div', { class: 'tile' }, el('span', {}, 'Logged'), el('strong', {}, `${w.total} h`), el('span', {}, capped ? `of ${available} h available` : (set.setUp ? 'no weekly cap' : 'this week'))),
+      capped ? el('div', { class: 'tile' }, el('span', {}, left >= 0 ? 'Left' : 'Over'), el('strong', {}, `${Math.abs(left)} h`), el('span', {}, 'this week')) : null,
+      capped ? el('div', { class: 'tile' }, el('span', {}, 'Frozen'), el('strong', {}, `${set.frozen} h`), el('span', {}, set.frozen ? `of ${set.capacity} h` : 'none this week')) : null,
       el('div', { class: 'tile' }, el('span', {}, 'Sessions'), el('strong', {}, `${round2(w.sessions.reduce((t, s) => t + (Number(s.hours) || 0), 0))} h`), el('span', {}, plural(w.sessions.length, 'session')))),
     el('div', { class: 'panel' },
       el('div', { class: 'projects-head' }, el('h3', {}, 'This week'),
-        el('button', { type: 'button', class: 'link', onclick: () => openWeekEdit(ws, set) }, 'Adjust this week')),
+        self && capped ? el('button', { type: 'button', class: 'link', onclick: () => openWeekEdit(ws, set) }, 'Adjust this week') : null),
       set.notes ? el('p', { class: 'field-hint' }, set.notes) : null,
-      bar,
-      el('div', { class: 'legend' }, [...TIME_TYPES, 'Left', 'Frozen'].map((t) => el('span', { 'data-type': t }, t))),
+      w.total || capped ? bar : null,
+      el('div', { class: 'legend' }, [...TIME_TYPES, ...(capped ? ['Left', 'Frozen'] : [])].map((t) => el('span', { 'data-type': t }, t))),
       dayRow,
       noTime ? el('p', { class: 'field-hint' }, `${plural(noTime, 'entry')} this week ${noTime === 1 ? 'has' : 'have'} no time. Add it with Edit in the Log.`) : null),
-    el('div', { class: 'panel' },
-      el('h3', {}, '40-hour framework'),
-      el('p', { class: 'field-hint' }, scale === 1 ? 'Targets for a full 40-hour week' : `Targets scaled to your ${available} available hours`),
-      framework),
+    set.setUp ? el('div', { class: 'panel' },
+      el('div', { class: 'projects-head' }, el('h3', {}, capped ? `${fullTarget}-hour framework` : 'Where the time went'),
+        self ? el('button', { type: 'button', class: 'link', onclick: () => openHoursSetup() }, 'Hour settings') : null),
+      el('p', { class: 'field-hint' }, !capped ? 'No weekly cap, so this shows how logged time splits up' : scale === 1 ? `Targets for a full ${fullTarget}-hour week` : `Targets scaled to ${self ? 'your' : 'the'} ${available} available hours`),
+      framework) : null,
     el('div', { class: 'panel' },
       el('h3', {}, 'By project'),
       projRows.length ? el('div', { class: 'table-wrap flat' }, el('table', { class: 'tasks-table hours-table' },
@@ -1464,8 +1507,37 @@ function renderHours() {
           el('span', {}, [`${s.hours} h`, s.status === 'Needs review' ? 'Needs review' : ''].filter(Boolean).join(', '))),
         el('div', { class: 'card-actions' },
           s.timesheet_line ? copyButton(() => s.timesheet_line, 'Copy snippet') : null,
-          el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit'))))) : el('p', { class: 'meter-empty' }, 'No finished sessions this week.')),
-  );
+          self ? el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit') : null)))) : el('p', { class: 'meter-empty' }, 'No finished sessions this week.')),
+  ].filter(Boolean));
+}
+
+// Hour settings: weekly target (or no cap), frozen hours until a date, and the three-bucket framework
+function openHoursSetup() {
+  const plan = hoursPlan(state.data.user.name) || { target: 40, noCap: false, frozen: 0, frozenUntil: '', framework: FRAMEWORK.map(([l, , lo, hi]) => [l, lo, hi]) };
+  const fwRows = FRAMEWORK.map(([label, , dlo, dhi, hint]) => {
+    const own = plan.framework.find((f) => f[0] === label) || [label, dlo, dhi];
+    return el('div', { class: 'row' },
+      field(`${label} min`, el('input', { name: `min_${label}`, type: 'number', min: 0, step: 0.5, value: own[1] }), hint),
+      field(`${label} max`, el('input', { name: `max_${label}`, type: 'number', min: 0, step: 0.5, value: own[2] })));
+  });
+  showDialog('Hour settings', [
+    el('p', { class: 'form-sub' }, 'How many hours a week you aim for and how you want them split. Hours themselves still come from the Log.'),
+    el('div', { class: 'row' },
+      field('Weekly target hours', el('input', { name: 'hours_target', type: 'number', min: 0, step: 0.5, value: plan.target })),
+      el('label', { class: 'switch' }, el('input', { type: 'checkbox', name: 'no_cap', checked: plan.noCap || null }), 'No weekly cap, just track what I log')),
+    el('div', { class: 'row' },
+      field('Frozen hours', el('input', { name: 'frozen', type: 'number', min: 0, step: 0.5, value: plan.frozen }), 'Hours held back each week, like 15 until a start date'),
+      field('Frozen until', el('input', { name: 'frozen_until', type: 'date', value: plan.frozenUntil }))),
+    el('h3', { class: 'end-title' }, 'Framework, for a full target week'),
+    ...fwRows,
+  ], async (v) => {
+    const hours_plan = {
+      no_cap: v.no_cap === 'on', frozen: Number(v.frozen) || 0, frozen_until: v.frozen_until || '',
+      framework: FRAMEWORK.map(([label]) => [label, Number(v[`min_${label}`]) || 0, Number(v[`max_${label}`]) || 0]),
+    };
+    await post('session', { action: 'hours_setup', hours_target: v.hours_target, hours_plan });
+    status('Hour settings saved');
+  }, 'Save settings');
 }
 
 function openWeekEdit(ws, set) {
@@ -1498,7 +1570,13 @@ function renderWeekStrip(view) {
   if (box.hidden) return;
   const ws = mondayOf(todayIso());
   const set = weekSettings(ws);
-  const available = Math.max(0, set.capacity - set.frozen);
+  if (!set.setUp) {
+    box.replaceChildren(el('a', { class: 'week-card', href: '#hours', style: 'text-decoration: none; color: inherit' },
+      el('div', {}, el('h2', {}, 'This week'), el('span', { class: 'week-sub' }, `${shortDate(ws)} to ${shortDate(addDays(ws, 6))}`)),
+      el('p', { class: 'week-sub' }, 'Set up your weekly hours in the Hours tab to see your progress here'), el('span', {})));
+    return;
+  }
+  const available = set.noCap ? 0 : Math.max(0, set.capacity - set.frozen);
   const w = weekData(ws);
   const live = liveSession();
   const sessHours = round2(w.sessions.reduce((t, s) => t + (Number(s.hours) || 0), 0) + (live ? sessionMinutes(live) / 60 : 0));
@@ -1506,14 +1584,14 @@ function renderWeekStrip(view) {
   // How far through the week we are, by the clock (Sunday 00:00 to Saturday 24:00)
   const start = parseIso(ws);
   const through = Math.min(1, Math.max(0, (Date.now() - start.getTime()) / (7 * 864e5)));
-  const pct = available ? Math.min(100, (worked / available) * 100) : 0;
+  const pct = available ? Math.min(100, (worked / available) * 100) : (worked ? 100 : 0);
   box.replaceChildren(el('a', { class: 'week-card', href: '#hours', style: 'text-decoration: none; color: inherit' },
     el('div', {}, el('h2', {}, 'This week'), el('span', { class: 'week-sub' }, `${shortDate(ws)} to ${shortDate(addDays(ws, 6))}`)),
     el('div', { class: 'pace-wrap' },
       el('div', { class: 'pace', role: 'img', 'aria-label': `${worked} of ${available} hours, ${Math.round(through * 100)}% through the week` },
         el('div', { class: 'pace-fill', style: `width: calc(${pct}% - 6px)` }),
-        el('div', { class: 'pace-mark', style: `left: ${through * 100}%`, 'data-label': `On pace: ${round2(available * through)} h` }))),
-    el('div', { class: 'week-num' }, `${worked}`, el('small', {}, `of ${available} h`))));
+        available ? el('div', { class: 'pace-mark', style: `left: ${through * 100}%`, 'data-label': `On pace: ${round2(available * through)} h` }) : null)),
+    el('div', { class: 'week-num' }, `${worked}`, el('small', {}, available ? `of ${available} h` : 'h logged'))));
 }
 
 function sessionList(list) {
