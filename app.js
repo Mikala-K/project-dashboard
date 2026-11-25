@@ -1602,6 +1602,47 @@ function sessionList(list) {
     el('button', { type: 'button', class: 'link', onclick: () => openEndSession(s, true) }, s.status === 'Needs review' ? 'Review' : 'Edit'))));
 }
 
+// ---------- search ----------
+// Finds open tasks and finished work (Log) by task number or keywords; every word must match
+function searchItems(q) {
+  const d = state.data;
+  const raw = q.trim().toLowerCase();
+  if (!raw) return [];
+  const num = /^t-?\s*(\d+)$/i.exec(raw) || /^(\d+)$/.exec(raw);
+  const words = raw.split(/\s+/);
+  const hit = (text, id) => (num ? idNum(id) === Number(num[1]) : words.every((w) => text.includes(w)));
+  const tasks = d.tickets.map((t) => ({ kind: 'task', t, text: [t.ticket_id, t.task, t.description, t.notes, t.category, projectName(t.project), t.assignee].join(' ').toLowerCase() }))
+    .filter((x) => hit(x.text, x.t.ticket_id))
+    .sort((a, b) => idNum(a.t.ticket_id) - idNum(b.t.ticket_id));
+  const openIds = new Set(d.tickets.map((t) => t.ticket_id));
+  const done = d.log.filter((l) => !openIds.has(l.ticket_id))
+    .map((l) => ({ kind: 'log', l, text: [l.ticket_id, l.task, l.what_was_done, projectName(l.project)].join(' ').toLowerCase() }))
+    .filter((x) => hit(x.text, x.l.ticket_id || 'none'));
+  return [...tasks, ...done].slice(0, 15);
+}
+function renderSearch() {
+  const box = $('search-box');
+  const out = $('search-results');
+  const q = box.value;
+  if (!q.trim() || !state.data) { out.hidden = true; return; }
+  const items = searchItems(q);
+  out.replaceChildren(...(items.length ? items.map((x) => {
+    const isTask = x.kind === 'task';
+    const id = isTask ? x.t.ticket_id : x.l.ticket_id;
+    const title = isTask ? x.t.task : x.l.task;
+    const sub = isTask
+      ? [projectName(x.t.project), x.t.status !== 'Open' ? x.t.status : '', x.t.due_date ? `Due ${x.t.due_date}` : ''].filter(Boolean).join(', ')
+      : [projectName(x.l.project), `Done ${String(x.l.completed_at || '').slice(0, 10)}`].join(', ');
+    return el('button', { type: 'button', class: 'search-item', role: 'option', onclick: () => {
+      out.hidden = true; box.value = '';
+      if (isTask) openTask({ task: x.t }); else openLogEdit(x.l);
+    } },
+      el('span', { class: 'search-title' }, [id, title].filter(Boolean).join(' ')),
+      el('span', { class: 'search-sub' }, sub));
+  }) : [el('p', { class: 'search-none' }, 'No tasks match')]));
+  out.hidden = false;
+}
+
 // ---------- events ----------
 window.addEventListener('hashchange', () => {
   const v = route().view;
@@ -1612,6 +1653,13 @@ window.addEventListener('hashchange', () => {
   render();
   window.scrollTo(0, 0);
 });
+$('search-box').addEventListener('input', renderSearch);
+$('search-box').addEventListener('focus', renderSearch);
+$('search-box').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { e.target.value = ''; $('search-results').hidden = true; }
+  if (e.key === 'Enter') { const first = $('search-results').querySelector('.search-item'); if (first) first.click(); }
+});
+document.addEventListener('click', (e) => { if (!e.target.closest('.search')) $('search-results').hidden = true; });
 $('push-left').addEventListener('click', pushLeft);
 $('push-right').addEventListener('click', pushRight);
 $('strip-left').addEventListener('click', () => setLayout('split'));

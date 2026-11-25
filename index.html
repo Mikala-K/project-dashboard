@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600&family=Nunito+Sans:opsz,wght@6..12,400;6..12,600;6..12,700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=s9">
+  <link rel="stylesheet" href="styles.css?v=s10">
 </head>
 <body>
   <header class="top">
@@ -32,6 +32,10 @@
       <a href="#tasks" data-view="tasks">All tasks</a>
       <a href="#hours" data-view="hours">Hours</a>
       <a href="#log" data-view="log">Log</a>
+      <div class="search" role="search">
+        <input id="search-box" type="search" placeholder="Search tasks: T-042 or keywords" aria-label="Search tasks by number or keyword" autocomplete="off">
+        <div class="search-results" id="search-results" role="listbox" hidden></div>
+      </div>
     </nav>
   </header>
   <div class="session-bar" id="session-bar" hidden></div>
@@ -101,6 +105,6 @@
   <dialog id="dialog" class="dialog"></dialog>
 
   <p class="status-line" id="status-line" role="status"></p>
-  <script src="app.js?v=s9"></script>
+  <script src="app.js?v=s10"></script>
 </body>
 </html>
